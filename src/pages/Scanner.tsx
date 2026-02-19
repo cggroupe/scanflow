@@ -156,10 +156,9 @@ function sharpenCanvas(canvas: HTMLCanvasElement, amount: number) {
   ctx.putImageData(original, 0, 0)
 }
 
-/** Process a raw canvas and return a File + thumbnail URL */
+/** Process a raw canvas and return a File + thumbnail URL (async, used by edit/import) */
 function processAndCreateFile(raw: HTMLCanvasElement, filter: Filter, adj: Adjustments): Promise<{ file: File; url: string }> {
   return new Promise((resolve, reject) => {
-    // Safety timeout — toBlob can silently hang on some mobile browsers
     const timeout = setTimeout(() => reject(new Error('Processing timeout')), 5000)
     try {
       const processed = processDocumentScan(raw, filter, adj)
@@ -174,6 +173,17 @@ function processAndCreateFile(raw: HTMLCanvasElement, filter: Filter, adj: Adjus
       reject(err)
     }
   })
+}
+
+/** Convert a canvas to a File synchronously via toDataURL (works on ALL browsers) */
+function canvasToFileSync(canvas: HTMLCanvasElement, quality = 0.92): { file: File; thumbnailUrl: string } {
+  const dataUrl = canvas.toDataURL('image/jpeg', quality)
+  const parts = dataUrl.split(',')
+  const byteStr = atob(parts[1])
+  const arr = new Uint8Array(byteStr.length)
+  for (let i = 0; i < byteStr.length; i++) arr[i] = byteStr.charCodeAt(i)
+  const file = new File([arr], `scan_${Date.now()}.jpg`, { type: 'image/jpeg' })
+  return { file, thumbnailUrl: dataUrl }
 }
 
 // ================================================================
@@ -434,8 +444,8 @@ export default function Scanner() {
     streamRef.current = null
   }
 
-  // ---- Capture: auto-process with defaults, stay in camera ----
-  async function capturePhoto() {
+  // ---- Capture: 100% synchronous, no async/await/toBlob ----
+  function capturePhoto() {
     const video = videoRef.current
     const container = videoContainerRef.current
     if (!video || !container) return
@@ -445,8 +455,8 @@ export default function Scanner() {
     setTimeout(() => setShowFlash(false), 200)
 
     try {
+      // Step 1: Capture raw frame
       let rawCanvas: HTMLCanvasElement
-
       if (corners && cvReady) {
         try {
           rawCanvas = perspectiveCorrect(video, corners)
@@ -457,8 +467,12 @@ export default function Scanner() {
         rawCanvas = cropFrame(video, container)
       }
 
-      // Auto-process with default settings (in background, stay in camera)
-      const { file, url } = await processAndCreateFile(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
+      // Step 2: Apply filters (synchronous)
+      const processed = processDocumentScan(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
+
+      // Step 3: Convert to file via toDataURL (synchronous, works everywhere)
+      const { file, thumbnailUrl } = canvasToFileSync(processed)
+
       const id = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
 
       setPages((prev) => [...prev, {
@@ -467,7 +481,7 @@ export default function Scanner() {
         filter: DEFAULT_FILTER,
         adjustments: { ...DEFAULT_ADJ },
         processedFile: file,
-        thumbnailUrl: url,
+        thumbnailUrl,
       }])
     } catch {
       // Show brief error on camera screen
