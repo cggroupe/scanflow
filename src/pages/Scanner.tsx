@@ -159,12 +159,20 @@ function sharpenCanvas(canvas: HTMLCanvasElement, amount: number) {
 /** Process a raw canvas and return a File + thumbnail URL */
 function processAndCreateFile(raw: HTMLCanvasElement, filter: Filter, adj: Adjustments): Promise<{ file: File; url: string }> {
   return new Promise((resolve, reject) => {
-    const processed = processDocumentScan(raw, filter, adj)
-    processed.toBlob((blob) => {
-      if (!blob) { reject(new Error('Blob creation failed')); return }
-      const file = new File([blob], `scan_${Date.now()}.jpg`, { type: 'image/jpeg' })
-      resolve({ file, url: URL.createObjectURL(blob) })
-    }, 'image/jpeg', 0.92)
+    // Safety timeout — toBlob can silently hang on some mobile browsers
+    const timeout = setTimeout(() => reject(new Error('Processing timeout')), 5000)
+    try {
+      const processed = processDocumentScan(raw, filter, adj)
+      processed.toBlob((blob) => {
+        clearTimeout(timeout)
+        if (!blob) { reject(new Error('Blob creation failed')); return }
+        const file = new File([blob], `scan_${Date.now()}.jpg`, { type: 'image/jpeg' })
+        resolve({ file, url: URL.createObjectURL(blob) })
+      }, 'image/jpeg', 0.92)
+    } catch (err) {
+      clearTimeout(timeout)
+      reject(err)
+    }
   })
 }
 
@@ -430,7 +438,7 @@ export default function Scanner() {
   async function capturePhoto() {
     const video = videoRef.current
     const container = videoContainerRef.current
-    if (!video || !container || video.videoWidth === 0) return
+    if (!video || !container) return
 
     // Flash feedback
     setShowFlash(true)
@@ -443,18 +451,10 @@ export default function Scanner() {
         try {
           rawCanvas = perspectiveCorrect(video, corners)
         } catch {
-          // OpenCV failed, fallback to A4 crop
-          const { sx, sy, sw, sh } = getFrameCropRect(video, container)
-          rawCanvas = document.createElement('canvas')
-          rawCanvas.width = sw; rawCanvas.height = sh
-          rawCanvas.getContext('2d')!.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh)
+          rawCanvas = cropFrame(video, container)
         }
       } else {
-        // No detection yet or OpenCV not loaded — crop to A4 frame
-        const { sx, sy, sw, sh } = getFrameCropRect(video, container)
-        rawCanvas = document.createElement('canvas')
-        rawCanvas.width = sw; rawCanvas.height = sh
-        rawCanvas.getContext('2d')!.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh)
+        rawCanvas = cropFrame(video, container)
       }
 
       // Auto-process with default settings (in background, stay in camera)
@@ -470,10 +470,36 @@ export default function Scanner() {
         thumbnailUrl: url,
       }])
     } catch {
-      // Capture failed, user can retry
+      // Show brief error on camera screen
+      setCameraError(t('scanner.cameraError'))
+      setTimeout(() => setCameraError(null), 3000)
     }
 
     // DON'T leave camera — user keeps shooting
+  }
+
+  /** Crop video to the A4 frame area, with fallback for 0-dimension edge cases */
+  function cropFrame(video: HTMLVideoElement, container: HTMLElement): HTMLCanvasElement {
+    const vw = video.videoWidth
+    const vh = video.videoHeight
+
+    if (vw > 0 && vh > 0) {
+      const { sx, sy, sw, sh } = getFrameCropRect(video, container)
+      const w = Math.max(1, sw)
+      const h = Math.max(1, sh)
+      const canvas = document.createElement('canvas')
+      canvas.width = w; canvas.height = h
+      canvas.getContext('2d')!.drawImage(video, sx, sy, sw, sh, 0, 0, w, h)
+      return canvas
+    }
+
+    // Fallback: video dimensions unavailable, capture at display size
+    const w = container.clientWidth || 1080
+    const h = container.clientHeight || 1920
+    const canvas = document.createElement('canvas')
+    canvas.width = w; canvas.height = h
+    canvas.getContext('2d')!.drawImage(video, 0, 0, w, h)
+    return canvas
   }
 
   function handleCameraDone() {
@@ -691,6 +717,13 @@ export default function Scanner() {
             <div className="absolute left-3 top-3 z-20 flex items-center gap-1.5 rounded-full bg-primary px-3 py-1.5 shadow-lg">
               <span className="material-symbols-outlined text-sm text-white">description</span>
               <span className="text-sm font-bold text-white">{pages.length}</span>
+            </div>
+          )}
+
+          {/* Error message (shows briefly on capture failure) */}
+          {cameraError && (
+            <div className="absolute left-3 right-3 top-14 z-30 rounded-lg bg-red-600/90 px-4 py-2.5 text-center text-sm font-medium text-white shadow-lg">
+              {cameraError}
             </div>
           )}
 
