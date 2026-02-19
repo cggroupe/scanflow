@@ -57,11 +57,13 @@ export function useAuth() {
 
     async function init() {
       try {
-        const {
-          data: { session },
-        } = await supabase!.auth.getSession()
-        if (session?.user) {
-          await syncProfile(session.user)
+        // Race against a timeout — if Supabase is paused/slow, don't block the app
+        const sessionPromise = supabase!.auth.getSession()
+        const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000))
+        const result = await Promise.race([sessionPromise, timeoutPromise])
+
+        if (result && 'data' in result && result.data.session?.user) {
+          await syncProfile(result.data.session.user)
         }
       } catch {
         // Session check failed (network, Supabase paused, etc.)
