@@ -13,7 +13,7 @@ export type AnnotationType =
   | 'drawing' | 'text' | 'stamp' | 'shape' | 'image'
 export type SharePermission = 'view' | 'download'
 
-export interface User {
+export interface Profile {
   id: string
   email: string
   full_name: string | null
@@ -23,6 +23,9 @@ export interface User {
   created_at: string
   updated_at: string
 }
+
+/** @deprecated Use Profile instead */
+export type User = Profile
 
 export interface Document {
   id: string
@@ -117,7 +120,7 @@ export interface Annotation {
 export interface Database {
   public: {
     Tables: {
-      users: { Row: User; Insert: Omit<User, 'id' | 'created_at' | 'updated_at'>; Update: Partial<Omit<User, 'id'>> }
+      profiles: { Row: Profile; Insert: Omit<Profile, 'created_at' | 'updated_at'>; Update: Partial<Omit<Profile, 'id'>> }
       documents: { Row: Document; Insert: Omit<Document, 'id' | 'created_at' | 'updated_at'>; Update: Partial<Omit<Document, 'id'>> }
       projects: { Row: Project; Insert: Omit<Project, 'id' | 'created_at'>; Update: Partial<Omit<Project, 'id'>> }
       jobs: { Row: Job; Insert: Omit<Job, 'id' | 'created_at'>; Update: Partial<Omit<Job, 'id'>> }

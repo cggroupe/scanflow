@@ -1,22 +1,25 @@
-import { useState } from 'react'
-import { Outlet } from 'react-router-dom'
-import Navbar from './Navbar'
-import Sidebar from './Sidebar'
+import { Outlet, Link } from 'react-router-dom'
+import BottomNav from './BottomNav'
+import MobileDrawer from './MobileDrawer'
 
 export default function AppShell() {
-  const [sidebarOpen, setSidebarOpen] = useState(false)
-
   return (
-    <div className="flex min-h-screen bg-background">
-      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+    <div className="mx-auto flex min-h-screen max-w-md flex-col bg-background font-display">
+      <MobileDrawer />
 
-      <div className="flex flex-1 flex-col">
-        <Navbar onMenuToggle={() => setSidebarOpen((v) => !v)} />
+      <main className="flex-1">
+        <Outlet />
+      </main>
 
-        <main className="flex-1 p-4 sm:p-6">
-          <Outlet />
-        </main>
-      </div>
+      {/* FAB — Scan */}
+      <Link
+        to="/scanner"
+        className="fixed bottom-20 left-1/2 z-30 flex h-16 w-16 -translate-x-1/2 items-center justify-center rounded-full bg-primary text-white shadow-lg shadow-primary/40 ring-4 ring-white transition-transform active:scale-90 dark:ring-[#131f1e]"
+      >
+        <span className="material-symbols-outlined text-4xl">photo_camera</span>
+      </Link>
+
+      <BottomNav />
     </div>
   )
 }

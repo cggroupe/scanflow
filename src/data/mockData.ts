@@ -20,6 +20,20 @@ export interface ToolCategory {
   readonly tools: readonly ToolItem[]
 }
 
+export interface MockDocument {
+  readonly id: string
+  readonly title: string
+  readonly type: 'pdf' | 'jpg' | 'scan'
+  readonly date: string
+  readonly size: string
+}
+
+export interface MockFolder {
+  readonly id: string
+  readonly title: string
+  readonly itemCount: number
+}
+
 export const navigationItems: readonly NavItem[] = [
   { label: 'Dashboard', i18nKey: 'nav.dashboard', path: '/dashboard', icon: 'LayoutDashboard' },
   { label: 'Documents', i18nKey: 'nav.documents', path: '/documents', icon: 'FileText' },
@@ -85,4 +99,22 @@ export const toolCategories: readonly ToolCategory[] = [
       { id: 'redact', i18nKey: 'tools.redact', icon: 'EyeOff', path: '/tools/redact', color: '#1e293b' },
     ],
   },
+]
+
+export const mockDocuments: readonly MockDocument[] = [
+  { id: '1', title: 'Contrat de location 2024.pdf', type: 'pdf', date: '15 fév. 2026', size: '2.4 MB' },
+  { id: '2', title: 'Facture Hydro-Québec.pdf', type: 'pdf', date: '12 fév. 2026', size: '1.8 MB' },
+  { id: '3', title: 'Reçu pharmacie.jpg', type: 'jpg', date: '10 fév. 2026', size: '856 KB' },
+  { id: '4', title: 'Scan passeport.pdf', type: 'scan', date: '8 fév. 2026', size: '3.1 MB' },
+  { id: '5', title: 'Notes de cours.pdf', type: 'pdf', date: '5 fév. 2026', size: '945 KB' },
+  { id: '6', title: 'Photo permis conduire.jpg', type: 'jpg', date: '3 fév. 2026', size: '1.2 MB' },
+  { id: '7', title: 'Déclaration impôts 2025.pdf', type: 'pdf', date: '1 fév. 2026', size: '4.5 MB' },
+  { id: '8', title: 'Relevé bancaire janvier.pdf', type: 'pdf', date: '28 jan. 2026', size: '890 KB' },
+]
+
+export const mockFolders: readonly MockFolder[] = [
+  { id: 'f1', title: 'Documents personnels', itemCount: 12 },
+  { id: 'f2', title: 'Factures', itemCount: 45 },
+  { id: 'f3', title: 'Travail', itemCount: 8 },
+  { id: 'f4', title: 'Médical', itemCount: 6 },
 ]

@@ -2,7 +2,6 @@ import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { supabase } from '@/lib/supabase'
-import { LogIn } from 'lucide-react'
 
 export default function Login() {
   const { t } = useTranslation()
@@ -30,54 +29,62 @@ export default function Login() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background px-4">
+    <div className="flex min-h-screen flex-col items-center justify-center bg-background px-4 dark:bg-[#131f1e]">
       <div className="w-full max-w-sm space-y-6">
+        {/* Logo */}
         <div className="text-center">
-          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-primary">
-            <LogIn className="h-6 w-6 text-white" />
+          <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-primary shadow-lg shadow-primary/20">
+            <span className="material-symbols-outlined text-3xl text-white">document_scanner</span>
           </div>
-          <h1 className="mt-4 text-2xl font-bold text-text-primary">ScanFlow</h1>
-          <p className="mt-1 text-sm text-text-secondary">{t('auth.login')}</p>
+          <h1 className="mt-4 text-2xl font-bold text-slate-900 dark:text-slate-100">ScanFlow</h1>
+          <p className="mt-1 text-sm text-slate-500">{t('auth.login')}</p>
         </div>
 
+        {/* Email/Password form */}
         <form onSubmit={handleSubmit} className="space-y-4">
           {error && (
             <div className="rounded-lg bg-danger/10 p-3 text-sm text-danger">{error}</div>
           )}
           <div>
-            <label htmlFor="email" className="block text-sm font-medium text-text-primary">{t('auth.email')}</label>
+            <label htmlFor="email" className="block text-sm font-medium text-slate-700 dark:text-slate-300">
+              {t('auth.email')}
+            </label>
             <input
               id="email"
               type="email"
               required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+              className="mt-1 block w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm text-slate-900 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary dark:border-slate-700 dark:bg-[#1a2b2a] dark:text-slate-100"
             />
           </div>
           <div>
-            <label htmlFor="password" className="block text-sm font-medium text-text-primary">{t('auth.password')}</label>
+            <label htmlFor="password" className="block text-sm font-medium text-slate-700 dark:text-slate-300">
+              {t('auth.password')}
+            </label>
             <input
               id="password"
               type="password"
               required
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+              className="mt-1 block w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm text-slate-900 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary dark:border-slate-700 dark:bg-[#1a2b2a] dark:text-slate-100"
             />
           </div>
           <button
             type="submit"
             disabled={loading}
-            className="w-full rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-white hover:bg-primary-dark disabled:opacity-50"
+            className="w-full rounded-lg bg-primary px-4 py-3 text-sm font-bold text-white shadow-md shadow-primary/20 transition-colors hover:bg-primary/90 disabled:opacity-50"
           >
             {loading ? t('common.loading') : t('auth.signIn')}
           </button>
         </form>
 
-        <p className="text-center text-sm text-text-secondary">
+        <p className="text-center text-sm text-slate-500">
           {t('auth.noAccount')}{' '}
-          <Link to="/register" className="font-medium text-primary hover:underline">{t('auth.signUp')}</Link>
+          <Link to="/register" className="font-semibold text-primary hover:underline">
+            {t('auth.signUp')}
+          </Link>
         </p>
       </div>
     </div>

@@ -4,17 +4,19 @@ import type { User } from '@/types'
 interface AppState {
   user: User | null
   locale: 'fr' | 'en'
-  sidebarOpen: boolean
+  drawerOpen: boolean
   setUser: (user: User | null) => void
   setLocale: (locale: 'fr' | 'en') => void
-  toggleSidebar: () => void
+  openDrawer: () => void
+  closeDrawer: () => void
 }
 
 export const useAppStore = create<AppState>((set) => ({
   user: null,
   locale: 'fr',
-  sidebarOpen: false,
+  drawerOpen: false,
   setUser: (user) => set({ user }),
   setLocale: (locale) => set({ locale }),
-  toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),
+  openDrawer: () => set({ drawerOpen: true }),
+  closeDrawer: () => set({ drawerOpen: false }),
 }))

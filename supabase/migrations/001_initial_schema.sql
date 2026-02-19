@@ -1,9 +1,10 @@
 -- ScanFlow - Migration initiale
--- 7 tables + RLS + indexes + triggers
+-- Tables: profiles + 6 tables métier + RLS + triggers
+-- Note: utilise auth.users de Supabase (pas de table users custom)
 
--- 1. Users
-CREATE TABLE users (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+-- 1. Profiles (extension de auth.users)
+CREATE TABLE profiles (
+  id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   email TEXT UNIQUE NOT NULL,
   full_name TEXT,
   role TEXT DEFAULT 'user' CHECK (role IN ('user', 'admin')),
@@ -13,10 +14,24 @@ CREATE TABLE users (
   updated_at TIMESTAMPTZ DEFAULT now()
 );
 
--- 2. Projects (referenced by documents)
+-- Auto-create profile on signup
+CREATE OR REPLACE FUNCTION handle_new_user()
+RETURNS TRIGGER AS $$
+BEGIN
+  INSERT INTO public.profiles (id, email, full_name)
+  VALUES (NEW.id, NEW.email, COALESCE(NEW.raw_user_meta_data->>'full_name', ''));
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION handle_new_user();
+
+-- 2. Projects
 CREATE TABLE projects (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+  user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
   title TEXT NOT NULL,
   description TEXT,
   color TEXT DEFAULT '#1c7b1d',
@@ -27,7 +42,7 @@ CREATE TABLE projects (
 -- 3. Documents
 CREATE TABLE documents (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+  user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
   title TEXT NOT NULL,
   doc_type TEXT DEFAULT 'scan' CHECK (doc_type IN (
     'scan', 'upload', 'output', 'signed', 'merged', 'split', 'compressed', 'converted'
@@ -57,7 +72,7 @@ CREATE INDEX idx_documents_search ON documents USING gin(to_tsvector('french', t
 -- 4. Jobs
 CREATE TABLE jobs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+  user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
   job_type TEXT NOT NULL CHECK (job_type IN (
     'scan', 'signature', 'merge', 'split', 'compress', 'convert',
     'ocr', 'watermark', 'page_numbers', 'protect', 'unlock',
@@ -78,7 +93,7 @@ CREATE TABLE jobs (
 -- 5. Signature Certificates
 CREATE TABLE signature_certificates (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+  user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
   document_original_id UUID REFERENCES documents(id),
   document_signe_id UUID REFERENCES documents(id),
   signataires JSONB NOT NULL,
@@ -91,7 +106,7 @@ CREATE TABLE signature_certificates (
 -- 6. Share Links
 CREATE TABLE share_links (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+  user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
   document_id UUID REFERENCES documents(id) ON DELETE CASCADE NOT NULL,
   token TEXT UNIQUE NOT NULL DEFAULT encode(gen_random_bytes(32), 'hex'),
   permissions TEXT DEFAULT 'view' CHECK (permissions IN ('view', 'download')),
@@ -106,7 +121,7 @@ CREATE TABLE share_links (
 -- 7. Annotations
 CREATE TABLE annotations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+  user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
   document_id UUID REFERENCES documents(id) ON DELETE CASCADE NOT NULL,
   page INTEGER NOT NULL,
   type TEXT CHECK (type IN (
@@ -129,6 +144,7 @@ CREATE TABLE annotations (
 -- Row-Level Security
 -- ============================================
 
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE jobs ENABLE ROW LEVEL SECURITY;
@@ -136,40 +152,45 @@ ALTER TABLE signature_certificates ENABLE ROW LEVEL SECURITY;
 ALTER TABLE share_links ENABLE ROW LEVEL SECURITY;
 ALTER TABLE annotations ENABLE ROW LEVEL SECURITY;
 
+-- Profiles: users can read/update their own profile
+CREATE POLICY "profiles_own_data" ON profiles
+  FOR ALL USING (id = auth.uid());
+
+-- Other tables: users see their own data, admins see everything
 CREATE POLICY "users_own_data" ON documents
   FOR ALL USING (
     user_id = auth.uid()
-    OR EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
+    OR EXISTS (SELECT 1 FROM profiles WHERE id = auth.uid() AND role = 'admin')
   );
 
 CREATE POLICY "users_own_data" ON projects
   FOR ALL USING (
     user_id = auth.uid()
-    OR EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
+    OR EXISTS (SELECT 1 FROM profiles WHERE id = auth.uid() AND role = 'admin')
   );
 
 CREATE POLICY "users_own_data" ON jobs
   FOR ALL USING (
     user_id = auth.uid()
-    OR EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
+    OR EXISTS (SELECT 1 FROM profiles WHERE id = auth.uid() AND role = 'admin')
   );
 
 CREATE POLICY "users_own_data" ON signature_certificates
   FOR ALL USING (
     user_id = auth.uid()
-    OR EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
+    OR EXISTS (SELECT 1 FROM profiles WHERE id = auth.uid() AND role = 'admin')
   );
 
 CREATE POLICY "users_own_data" ON share_links
   FOR ALL USING (
     user_id = auth.uid()
-    OR EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
+    OR EXISTS (SELECT 1 FROM profiles WHERE id = auth.uid() AND role = 'admin')
   );
 
 CREATE POLICY "users_own_data" ON annotations
   FOR ALL USING (
     user_id = auth.uid()
-    OR EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
+    OR EXISTS (SELECT 1 FROM profiles WHERE id = auth.uid() AND role = 'admin')
   );
 
 CREATE POLICY "public_share_access" ON documents
@@ -192,7 +213,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER set_updated_at BEFORE UPDATE ON users
+CREATE TRIGGER set_updated_at BEFORE UPDATE ON profiles
   FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
 CREATE TRIGGER set_updated_at BEFORE UPDATE ON documents
