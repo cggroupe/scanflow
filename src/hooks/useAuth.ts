@@ -56,11 +56,15 @@ export function useAuth() {
     }
 
     async function init() {
-      const {
-        data: { session },
-      } = await supabase!.auth.getSession()
-      if (session?.user) {
-        await syncProfile(session.user)
+      try {
+        const {
+          data: { session },
+        } = await supabase!.auth.getSession()
+        if (session?.user) {
+          await syncProfile(session.user)
+        }
+      } catch {
+        // Session check failed (network, Supabase paused, etc.)
       }
       setLoading(false)
     }
