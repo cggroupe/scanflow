@@ -11,34 +11,41 @@ export interface DocumentCorners {
 interface UseDocumentDetectionOptions {
   videoRef: React.RefObject<HTMLVideoElement | null>
   enabled: boolean
-  detectionFps?: number
 }
 
 export function useDocumentDetection({
   videoRef,
   enabled,
-  detectionFps = 10,
 }: UseDocumentDetectionOptions) {
   const [corners, setCorners] = useState<DocumentCorners | null>(null)
   const [cvReady, setCvReady] = useState(isOpenCVReady())
   const rafRef = useRef<number>(0)
   const lastDetectionTime = useRef(0)
+  // Reuse one canvas across frames to avoid GC pressure
+  const detectCanvasRef = useRef<HTMLCanvasElement | null>(null)
 
-  // Load OpenCV on mount
+  // Load OpenCV LAZILY — only when camera is active, with 2s delay
+  // This prevents the 8MB script from freezing the page on mount
   useEffect(() => {
-    loadOpenCV()
-      .then(() => setCvReady(true))
-      .catch(() => {}) // silent fail → fallback to A4 frame
-  }, [])
+    if (!enabled || cvReady) return
 
-  // Detection loop
+    const timer = setTimeout(() => {
+      loadOpenCV()
+        .then(() => setCvReady(true))
+        .catch(() => {}) // silent fail → A4 frame stays
+    }, 2000)
+
+    return () => clearTimeout(timer)
+  }, [enabled, cvReady])
+
+  // Detection loop — 5fps on 320px canvas (lightweight)
   useEffect(() => {
     if (!enabled || !cvReady) {
       setCorners(null)
       return
     }
 
-    const interval = 1000 / detectionFps
+    const interval = 200 // 5fps
 
     function detect() {
       rafRef.current = requestAnimationFrame(detect)
@@ -51,16 +58,16 @@ export function useDocumentDetection({
       if (!video || video.videoWidth === 0 || video.readyState < 2) return
 
       try {
-        const result = detectDocument(video)
+        const result = detectDocument(video, detectCanvasRef)
         setCorners(result)
       } catch {
-        // OpenCV error, ignore
+        // OpenCV error, ignore — A4 frame stays
       }
     }
 
     rafRef.current = requestAnimationFrame(detect)
     return () => cancelAnimationFrame(rafRef.current)
-  }, [enabled, cvReady, detectionFps, videoRef])
+  }, [enabled, cvReady, videoRef])
 
   const perspectiveCorrect = useCallback(
     (video: HTMLVideoElement, detectedCorners: DocumentCorners): HTMLCanvasElement => {
@@ -74,15 +81,22 @@ export function useDocumentDetection({
 
 // --- Internal detection pipeline ---
 
-function detectDocument(video: HTMLVideoElement): DocumentCorners | null {
+function detectDocument(
+  video: HTMLVideoElement,
+  canvasRef: React.MutableRefObject<HTMLCanvasElement | null>,
+): DocumentCorners | null {
   const cv = window.cv
 
-  // Scale down for performance (max 640px wide)
-  const scale = Math.min(1, 640 / video.videoWidth)
+  // Scale down to max 320px wide (4x less work than 640px)
+  const scale = Math.min(1, 320 / video.videoWidth)
   const w = Math.round(video.videoWidth * scale)
   const h = Math.round(video.videoHeight * scale)
 
-  const canvas = document.createElement('canvas')
+  // Reuse canvas element across frames
+  if (!canvasRef.current) {
+    canvasRef.current = document.createElement('canvas')
+  }
+  const canvas = canvasRef.current
   canvas.width = w
   canvas.height = h
   canvas.getContext('2d')!.drawImage(video, 0, 0, w, h)
