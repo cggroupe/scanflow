@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useMemo, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import ResultScreen from '@/components/ResultScreen/ResultScreen'
+import { useDocumentDetection } from '@/hooks/useDocumentDetection'
 import { imagesToPdf, toBlob } from '@/lib/pdf'
 import { useDocumentStore } from '@/stores/documentStore'
 
@@ -238,6 +239,11 @@ export default function Scanner() {
   const [editAdj, setEditAdj] = useState<Adjustments>(DEFAULT_ADJ)
   const [editPreviewUrl, setEditPreviewUrl] = useState('')
 
+  // OpenCV runs in a Web Worker — loads in background, never blocks the UI
+  const { cvReady, detectAndCrop } = useDocumentDetection({
+    enabled: phase === 'camera',
+  })
+
   // Cleanup on unmount
   useEffect(() => () => {
     if (videoRef.current) {
@@ -355,9 +361,9 @@ export default function Scanner() {
     streamRef.current = null
   }
 
-  // ---- Capture: 100% synchronous, no async/await/toBlob ----
-  function capturePhoto() {
-    // Flash FIRST — even before checks — so user sees something happened
+  // ---- Capture: flash is sync, detection runs in Web Worker ----
+  async function capturePhoto() {
+    // Flash FIRST — user sees feedback immediately
     setShowFlash(true)
     setTimeout(() => setShowFlash(false), 200)
 
@@ -370,7 +376,15 @@ export default function Scanner() {
     }
 
     try {
-      const rawCanvas = cropFrame(video, container)
+      // Try auto-detect via Web Worker (runs in background thread, non-blocking)
+      let rawCanvas: HTMLCanvasElement
+      if (cvReady) {
+        const detected = await detectAndCrop(video)
+        rawCanvas = detected ?? cropFrame(video, container)
+      } else {
+        rawCanvas = cropFrame(video, container)
+      }
+
       const processed = processDocumentScan(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
       const { file, thumbnailUrl } = canvasToFileSync(processed)
 
@@ -635,7 +649,7 @@ export default function Scanner() {
           {/* Guide text */}
           <div className="absolute bottom-3 left-0 right-0 z-20 text-center">
             <span className="rounded-full bg-black/50 px-4 py-1.5 text-xs font-medium text-white/90">
-              {t('scanner.alignDocument')}
+              {cvReady ? t('scanner.autoDetectReady') : t('scanner.alignDocument')}
             </span>
           </div>
         </div>
