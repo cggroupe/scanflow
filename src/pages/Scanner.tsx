@@ -231,6 +231,7 @@ export default function Scanner() {
   const [resultBlob, setResultBlob] = useState<Blob | null>(null)
   const [processError, setProcessError] = useState<string | null>(null)
   const [cameraError, setCameraError] = useState<string | null>(null)
+  const [cameraSuccess, setCameraSuccess] = useState<string | null>(null)
   const [showFlash, setShowFlash] = useState(false)
 
   // Per-page editing state
@@ -378,19 +379,26 @@ export default function Scanner() {
     try {
       // Try auto-detect via Web Worker (runs in background thread, non-blocking)
       let rawCanvas: HTMLCanvasElement
-      let debugInfo = 'no opencv'
+      let detected = false
 
       if (cvReady) {
         const result = await detectAndCrop(video)
-        debugInfo = result.debug
-        rawCanvas = result.canvas ?? cropFrame(video, container)
+        console.log('[ScanFlow] detection:', result.debug)
+        if (result.canvas) {
+          rawCanvas = result.canvas
+          detected = true
+        } else {
+          rawCanvas = cropFrame(video, container)
+        }
       } else {
         rawCanvas = cropFrame(video, container)
       }
 
-      // Show debug info briefly so user can report what happened
-      setCameraError(debugInfo)
-      setTimeout(() => setCameraError(null), 3000)
+      // Show green success message when auto-detect worked
+      if (detected) {
+        setCameraSuccess(t('scanner.documentDetected'))
+        setTimeout(() => setCameraSuccess(null), 2000)
+      }
 
       const processed = processDocumentScan(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
       const { file, thumbnailUrl } = canvasToFileSync(processed)
@@ -650,6 +658,14 @@ export default function Scanner() {
           {cameraError && (
             <div className="absolute left-3 right-3 top-14 z-30 rounded-lg bg-red-600/90 px-4 py-2.5 text-center text-sm font-medium text-white shadow-lg">
               {cameraError}
+            </div>
+          )}
+
+          {/* Success message (shows briefly when document auto-detected) */}
+          {cameraSuccess && (
+            <div className="absolute left-3 right-3 top-14 z-30 flex items-center justify-center gap-2 rounded-lg bg-green-600/90 px-4 py-2.5 text-center text-sm font-medium text-white shadow-lg">
+              <span className="material-symbols-outlined text-base">check_circle</span>
+              {cameraSuccess}
             </div>
           )}
 
