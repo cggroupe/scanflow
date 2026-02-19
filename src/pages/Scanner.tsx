@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import ResultScreen from '@/components/ResultScreen/ResultScreen'
+import { useDocumentDetection } from '@/hooks/useDocumentDetection'
 import { imagesToPdf, toBlob } from '@/lib/pdf'
 import { useDocumentStore } from '@/stores/documentStore'
 
@@ -199,10 +200,13 @@ export default function Scanner() {
   const addDocument = useDocumentStore((s) => s.addDocument)
   const setPendingFile = useDocumentStore((s) => s.setPendingFile)
 
+  const [searchParams] = useSearchParams()
+
   const videoRef = useRef<HTMLVideoElement>(null)
   const videoContainerRef = useRef<HTMLDivElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const importRef = useRef<HTMLInputElement | null>(null)
+  const overlayCanvasRef = useRef<HTMLCanvasElement>(null)
 
   const [phase, setPhase] = useState<Phase>('home')
   const [pages, setPages] = useState<ScannedPage[]>([])
@@ -217,8 +221,28 @@ export default function Scanner() {
   const [editAdj, setEditAdj] = useState<Adjustments>(DEFAULT_ADJ)
   const [editPreviewUrl, setEditPreviewUrl] = useState('')
 
+  const { corners, cvReady, perspectiveCorrect } = useDocumentDetection({
+    videoRef,
+    enabled: phase === 'camera',
+  })
+
   // Cleanup on unmount
-  useEffect(() => () => { streamRef.current?.getTracks().forEach((tr) => tr.stop()) }, [])
+  useEffect(() => () => {
+    if (videoRef.current) {
+      videoRef.current.pause()
+      videoRef.current.srcObject = null
+    }
+    streamRef.current?.getTracks().forEach((tr) => tr.stop())
+    streamRef.current = null
+  }, [])
+
+  // Auto-open camera if ?mode=camera
+  useEffect(() => {
+    if (searchParams.get('mode') === 'camera' && phase === 'home') {
+      openCamera()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Editing page reference
   const editingPage = pages.find((p) => p.id === editingPageId) ?? null
@@ -244,24 +268,158 @@ export default function Scanner() {
     setEditPreviewUrl(processed.toDataURL('image/jpeg', 0.85))
   }, [phase, editPreviewCanvas, editFilter, editAdj])
 
+  // Draw detected document outline on overlay canvas
+  useEffect(() => {
+    const canvas = overlayCanvasRef.current
+    const container = videoContainerRef.current
+    if (!canvas || !container || phase !== 'camera') return
+
+    const ctx = canvas.getContext('2d')!
+    canvas.width = container.clientWidth
+    canvas.height = container.clientHeight
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+
+    if (!corners) return
+
+    const video = videoRef.current
+    if (!video || video.videoWidth === 0) return
+
+    // Map video coordinates to container coordinates
+    const cW = container.clientWidth
+    const cH = container.clientHeight
+    const vW = video.videoWidth
+    const vH = video.videoHeight
+    const cAspect = cW / cH
+    const vAspect = vW / vH
+
+    let renderW: number, renderH: number, offX: number, offY: number
+    if (vAspect > cAspect) {
+      renderH = cH; renderW = cH * vAspect
+      offX = -(renderW - cW) / 2; offY = 0
+    } else {
+      renderW = cW; renderH = cW / vAspect
+      offX = 0; offY = -(renderH - cH) / 2
+    }
+    const scaleX = renderW / vW
+    const scaleY = renderH / vH
+
+    function toScreen(pt: { x: number; y: number }) {
+      return { x: pt.x * scaleX + offX, y: pt.y * scaleY + offY }
+    }
+
+    const tl = toScreen(corners.topLeft)
+    const tr = toScreen(corners.topRight)
+    const br = toScreen(corners.bottomRight)
+    const bl = toScreen(corners.bottomLeft)
+
+    // Semi-transparent overlay outside document
+    ctx.fillStyle = 'rgba(0,0,0,0.4)'
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+
+    // Cut out document area
+    ctx.globalCompositeOperation = 'destination-out'
+    ctx.beginPath()
+    ctx.moveTo(tl.x, tl.y)
+    ctx.lineTo(tr.x, tr.y)
+    ctx.lineTo(br.x, br.y)
+    ctx.lineTo(bl.x, bl.y)
+    ctx.closePath()
+    ctx.fill()
+    ctx.globalCompositeOperation = 'source-over'
+
+    // Green border
+    ctx.strokeStyle = '#22c55e'
+    ctx.lineWidth = 3
+    ctx.beginPath()
+    ctx.moveTo(tl.x, tl.y)
+    ctx.lineTo(tr.x, tr.y)
+    ctx.lineTo(br.x, br.y)
+    ctx.lineTo(bl.x, bl.y)
+    ctx.closePath()
+    ctx.stroke()
+
+    // Corner dots
+    for (const pt of [tl, tr, br, bl]) {
+      ctx.beginPath()
+      ctx.arc(pt.x, pt.y, 6, 0, Math.PI * 2)
+      ctx.fillStyle = '#22c55e'
+      ctx.fill()
+      ctx.strokeStyle = '#fff'
+      ctx.lineWidth = 2
+      ctx.stroke()
+    }
+  }, [corners, phase])
+
   // ---- Camera ----
   const openCamera = useCallback(async () => {
     setCameraError(null)
+
+    // Clean up any existing stream first
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((tr) => tr.stop())
+      streamRef.current = null
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
       })
       streamRef.current = stream
+
+      // Set phase first to trigger render of <video> element
       setPhase('camera')
-      requestAnimationFrame(() => {
-        if (videoRef.current) { videoRef.current.srcObject = stream; videoRef.current.play() }
-      })
+
+      // Wait for React to mount the video element, then attach stream
+      const attachStream = async (retries = 20): Promise<void> => {
+        const video = videoRef.current
+        if (!video) {
+          if (retries > 0) {
+            await new Promise((r) => setTimeout(r, 50))
+            return attachStream(retries - 1)
+          }
+          throw new Error('Video element not found')
+        }
+
+        video.srcObject = stream
+
+        // Wait for metadata to load
+        const v = video // capture non-null reference
+        await new Promise<void>((resolve, reject) => {
+          if (v.readyState >= 1) { resolve(); return }
+          const onLoaded = () => { cleanup(); resolve() }
+          const onError = () => { cleanup(); reject(new Error('Video load error')) }
+          const timeout = setTimeout(() => { cleanup(); reject(new Error('Timeout')) }, 5000)
+          function cleanup() {
+            v.removeEventListener('loadedmetadata', onLoaded)
+            v.removeEventListener('error', onError)
+            clearTimeout(timeout)
+          }
+          v.addEventListener('loadedmetadata', onLoaded, { once: true })
+          v.addEventListener('error', onError, { once: true })
+        })
+
+        await video.play()
+      }
+
+      await attachStream()
     } catch {
+      // If stream was acquired but video failed, clean up
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((tr) => tr.stop())
+        streamRef.current = null
+      }
       setCameraError(t('scanner.cameraError'))
     }
   }, [t])
 
   function stopCamera() {
+    if (videoRef.current) {
+      videoRef.current.pause()
+      videoRef.current.srcObject = null
+    }
     streamRef.current?.getTracks().forEach((tr) => tr.stop())
     streamRef.current = null
   }
@@ -276,11 +434,18 @@ export default function Scanner() {
     setShowFlash(true)
     setTimeout(() => setShowFlash(false), 200)
 
-    // Crop to A4 frame area
-    const { sx, sy, sw, sh } = getFrameCropRect(video, container)
-    const rawCanvas = document.createElement('canvas')
-    rawCanvas.width = sw; rawCanvas.height = sh
-    rawCanvas.getContext('2d')!.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh)
+    let rawCanvas: HTMLCanvasElement
+
+    if (corners && cvReady) {
+      // Use perspective correction for bird's-eye view
+      rawCanvas = perspectiveCorrect(video, corners)
+    } else {
+      // Fallback: crop to A4 frame area
+      const { sx, sy, sw, sh } = getFrameCropRect(video, container)
+      rawCanvas = document.createElement('canvas')
+      rawCanvas.width = sw; rawCanvas.height = sh
+      rawCanvas.getContext('2d')!.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh)
+    }
 
     // Auto-process with default settings (in background, stay in camera)
     const { file, url } = await processAndCreateFile(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
@@ -484,19 +649,26 @@ export default function Scanner() {
         <div ref={videoContainerRef} className="relative flex-1 overflow-hidden">
           <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover" />
 
-          {/* A4 document guide */}
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-            <div
-              className="relative"
-              style={{ width: '80%', aspectRatio: '210 / 297', boxShadow: '0 0 0 9999px rgba(0,0,0,0.4)', borderRadius: '8px' }}
-            >
-              <div className="absolute inset-0 rounded-lg border border-white/50" />
-              <div className="absolute -left-px -top-px h-7 w-7 rounded-tl-lg border-l-[3px] border-t-[3px] border-primary" />
-              <div className="absolute -right-px -top-px h-7 w-7 rounded-tr-lg border-r-[3px] border-t-[3px] border-primary" />
-              <div className="absolute -bottom-px -left-px h-7 w-7 rounded-bl-lg border-b-[3px] border-l-[3px] border-primary" />
-              <div className="absolute -bottom-px -right-px h-7 w-7 rounded-br-lg border-b-[3px] border-r-[3px] border-primary" />
+          {/* Document detection overlay (or fallback A4 guide) */}
+          {corners ? (
+            <canvas
+              ref={overlayCanvasRef}
+              className="pointer-events-none absolute inset-0 z-10"
+            />
+          ) : (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+              <div
+                className="relative"
+                style={{ width: '80%', aspectRatio: '210 / 297', boxShadow: '0 0 0 9999px rgba(0,0,0,0.4)', borderRadius: '8px' }}
+              >
+                <div className="absolute inset-0 rounded-lg border border-white/50" />
+                <div className="absolute -left-px -top-px h-7 w-7 rounded-tl-lg border-l-[3px] border-t-[3px] border-primary" />
+                <div className="absolute -right-px -top-px h-7 w-7 rounded-tr-lg border-r-[3px] border-t-[3px] border-primary" />
+                <div className="absolute -bottom-px -left-px h-7 w-7 rounded-bl-lg border-b-[3px] border-l-[3px] border-primary" />
+                <div className="absolute -bottom-px -right-px h-7 w-7 rounded-br-lg border-b-[3px] border-r-[3px] border-primary" />
+              </div>
             </div>
-          </div>
+          )}
 
           {/* Flash */}
           <div className={`pointer-events-none absolute inset-0 z-10 bg-white transition-opacity duration-200 ease-out ${showFlash ? 'opacity-70' : 'opacity-0'}`} />
@@ -512,7 +684,7 @@ export default function Scanner() {
           {/* Guide text */}
           <div className="absolute bottom-3 left-0 right-0 z-20 text-center">
             <span className="rounded-full bg-black/50 px-4 py-1.5 text-xs font-medium text-white/90">
-              {t('scanner.alignDocument')}
+              {corners ? t('scanner.documentDetected') : t('scanner.alignDocument')}
             </span>
           </div>
         </div>

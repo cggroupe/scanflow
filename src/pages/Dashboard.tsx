@@ -4,7 +4,7 @@ import { useAppStore } from '@/stores/appStore'
 import { useDocumentStore, formatFileSize, formatRelativeDate } from '@/stores/documentStore'
 
 const quickActions = [
-  { i18nKey: 'dashboard.smartScan', icon: 'center_focus_weak', path: '/scanner', bgClass: 'bg-primary/10', iconClass: 'text-primary icon-filled' },
+  { i18nKey: 'dashboard.smartScan', icon: 'center_focus_weak', path: '/scanner?mode=camera', bgClass: 'bg-primary/10', iconClass: 'text-primary icon-filled' },
   { i18nKey: 'dashboard.pdfToWord', icon: 'picture_as_pdf', path: '/tools/pdf-to-word', bgClass: 'bg-orange-50 dark:bg-orange-900/20', iconClass: 'text-orange-500' },
   { i18nKey: 'dashboard.importImages', icon: 'image', path: '/tools/jpg-to-pdf', bgClass: 'bg-blue-50 dark:bg-blue-900/20', iconClass: 'text-blue-500' },
 ]
@@ -83,7 +83,7 @@ export default function Dashboard() {
           <div className="mt-8 flex flex-col items-center gap-3 text-center">
             <span className="material-symbols-outlined text-5xl text-slate-300 dark:text-slate-600">description</span>
             <p className="text-sm text-slate-400 dark:text-slate-500">Aucun document pour le moment</p>
-            <Link to="/scanner" className="mt-2 rounded-lg bg-primary px-6 py-2.5 text-sm font-bold text-white shadow-md">
+            <Link to="/scanner?mode=camera" className="mt-2 rounded-lg bg-primary px-6 py-2.5 text-sm font-bold text-white shadow-md">
               {t('dashboard.smartScan')}
             </Link>
           </div>

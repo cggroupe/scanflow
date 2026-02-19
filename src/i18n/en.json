@@ -185,6 +185,7 @@
     "filter_grayscale": "Gray",
     "filter_highContrast": "Contrast",
     "alignDocument": "Align the document within the frame",
+    "documentDetected": "Document detected",
     "addPage": "Add page",
     "scanned": "scanned",
     "tapToEdit": "Tap a page to adjust settings",

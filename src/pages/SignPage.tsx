@@ -63,8 +63,9 @@ export default function SignPage() {
   // Location
   const [location, setLocation] = useState<string | null>(null)
 
-  // Resize state
+  // Resize & drag state
   const resizing = useRef<{ id: string; startX: number; startScale: number } | null>(null)
+  const dragging = useRef<{ id: string; startX: number; startY: number; origX: number; origY: number } | null>(null)
 
   const handleFilesChange = useCallback((f: File[]) => setFiles(f), [])
 
@@ -118,6 +119,8 @@ export default function SignPage() {
     if (!activeSignatureId) return
     // Don't place if tapping on an existing signature
     if ((e.target as HTMLElement).closest('[data-placed-sig]')) return
+    // Don't place if we just finished dragging
+    if (dragging.current) return
 
     const rect = e.currentTarget.getBoundingClientRect()
     const x = (e.clientX - rect.left) / rect.width
@@ -131,9 +134,20 @@ export default function SignPage() {
     setSelectedPlacedId(id)
   }
 
-  function selectPlacedSignature(e: React.PointerEvent, id: string) {
+  function startDrag(e: React.PointerEvent, id: string) {
     e.stopPropagation()
+    e.preventDefault()
+    const sig = placedSignatures.find((s) => s.id === id)
+    if (!sig) return
     setSelectedPlacedId(id)
+    dragging.current = {
+      id,
+      startX: e.clientX,
+      startY: e.clientY,
+      origX: sig.x,
+      origY: sig.y,
+    }
+    ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
   }
 
   function removePlacedSignature(id: string) {
@@ -151,19 +165,36 @@ export default function SignPage() {
     ;(e.target as HTMLElement).setPointerCapture(e.pointerId)
   }
 
-  function onResizeMove(e: React.PointerEvent) {
-    if (!resizing.current) return
-    const containerWidth = containerRef.current?.getBoundingClientRect().width ?? 350
-    const dx = e.clientX - resizing.current.startX
-    const deltaScale = (dx / containerWidth) * 4
-    const newScale = Math.max(0.3, Math.min(3, resizing.current.startScale + deltaScale))
-    setPlacedSignatures((prev) =>
-      prev.map((s) => (s.id === resizing.current!.id ? { ...s, scale: newScale } : s)),
-    )
+  function onPointerMoveHandler(e: React.PointerEvent) {
+    // Handle resize
+    if (resizing.current) {
+      const containerWidth = containerRef.current?.getBoundingClientRect().width ?? 350
+      const dx = e.clientX - resizing.current.startX
+      const deltaScale = (dx / containerWidth) * 4
+      const newScale = Math.max(0.3, Math.min(3, resizing.current.startScale + deltaScale))
+      setPlacedSignatures((prev) =>
+        prev.map((s) => (s.id === resizing.current!.id ? { ...s, scale: newScale } : s)),
+      )
+      return
+    }
+
+    // Handle drag
+    if (dragging.current) {
+      const rect = containerRef.current?.getBoundingClientRect()
+      if (!rect) return
+      const dx = (e.clientX - dragging.current.startX) / rect.width
+      const dy = (e.clientY - dragging.current.startY) / rect.height
+      const newX = Math.max(0, Math.min(1, dragging.current.origX + dx))
+      const newY = Math.max(0, Math.min(1, dragging.current.origY + dy))
+      setPlacedSignatures((prev) =>
+        prev.map((s) => (s.id === dragging.current!.id ? { ...s, x: newX, y: newY } : s)),
+      )
+    }
   }
 
-  function onResizeEnd() {
+  function onPointerEndHandler() {
     resizing.current = null
+    dragging.current = null
   }
 
   function getSignatureDataUrl(signatureId: string): string {
@@ -383,10 +414,11 @@ export default function SignPage() {
             <div
               ref={containerRef}
               className="relative mx-auto w-fit overflow-hidden rounded-lg shadow-md"
+              style={{ touchAction: 'none' }}
               onPointerDown={handlePageTap}
-              onPointerMove={onResizeMove}
-              onPointerUp={onResizeEnd}
-              onPointerCancel={onResizeEnd}
+              onPointerMove={onPointerMoveHandler}
+              onPointerUp={onPointerEndHandler}
+              onPointerCancel={onPointerEndHandler}
             >
               <PdfPageCanvas file={files[0]} pageNum={currentPage} width={350} />
 
@@ -395,19 +427,24 @@ export default function SignPage() {
                 <div
                   key={sig.id}
                   data-placed-sig
-                  className={`absolute cursor-pointer ${selectedPlacedId === sig.id ? 'z-10' : ''}`}
+                  className={`absolute cursor-grab touch-none ${selectedPlacedId === sig.id ? 'z-10' : ''}`}
                   style={{
                     left: `${sig.x * 100}%`,
                     top: `${sig.y * 100}%`,
                     width: `${sig.scale * 25}%`,
                     transform: 'translate(-50%, -50%)',
+                    touchAction: 'none',
                   }}
-                  onPointerDown={(e) => selectPlacedSignature(e, sig.id)}
+                  onPointerDown={(e) => startDrag(e, sig.id)}
+                  onPointerMove={onPointerMoveHandler}
+                  onPointerUp={onPointerEndHandler}
+                  onPointerCancel={onPointerEndHandler}
                 >
                   <img
                     src={getSignatureDataUrl(sig.signatureId)}
                     alt="signature"
-                    className={`pointer-events-none w-full border ${
+                    draggable={false}
+                    className={`pointer-events-none w-full select-none border ${
                       selectedPlacedId === sig.id ? 'border-primary' : 'border-transparent'
                     }`}
                     style={{ opacity: 0.85 }}
@@ -417,14 +454,13 @@ export default function SignPage() {
                     {t('signPage.signed')} {formatTimestamp()}
                   </p>
 
-                  {/* Resize handle (selected only) */}
+                  {/* Resize handle & delete (selected only) */}
                   {selectedPlacedId === sig.id && (
                     <>
                       <div
                         className="absolute -bottom-2 -right-2 h-5 w-5 cursor-se-resize rounded-full border-2 border-white bg-primary shadow touch-none"
                         onPointerDown={(e) => startResize(e, sig.id)}
                       />
-                      {/* Delete button */}
                       <button
                         className="absolute -right-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full bg-danger text-white shadow"
                         onPointerDown={(e) => { e.stopPropagation(); removePlacedSignature(sig.id) }}
