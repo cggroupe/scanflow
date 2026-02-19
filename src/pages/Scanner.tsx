@@ -241,7 +241,7 @@ export default function Scanner() {
   const [editPreviewUrl, setEditPreviewUrl] = useState('')
 
   // Document detection (OpenCV loads lazily 2s after camera opens)
-  const { corners, cvReady, perspectiveCorrect } = useDocumentDetection({
+  const { corners, cvReady, perspectiveCorrect, pause: pauseDetection, resume: resumeDetection } = useDocumentDetection({
     videoRef,
     enabled: phase === 'camera',
   })
@@ -450,6 +450,9 @@ export default function Scanner() {
     const container = videoContainerRef.current
     if (!video || !container) return
 
+    // Pause OpenCV detection during capture to free up the main thread
+    pauseDetection()
+
     // Flash feedback
     setShowFlash(true)
     setTimeout(() => setShowFlash(false), 200)
@@ -488,6 +491,9 @@ export default function Scanner() {
       setCameraError(t('scanner.cameraError'))
       setTimeout(() => setCameraError(null), 3000)
     }
+
+    // Resume detection after a short delay (let UI update first)
+    setTimeout(() => resumeDetection(), 300)
 
     // DON'T leave camera — user keeps shooting
   }
@@ -766,7 +772,11 @@ export default function Scanner() {
           <button onClick={() => { stopCamera(); setPhase(pages.length > 0 ? 'review' : 'home') }} className="min-w-[64px] rounded-lg px-2 py-2 text-sm font-medium text-white/80">
             {t('common.cancel')}
           </button>
-          <button onClick={capturePhoto} className="flex h-[72px] w-[72px] items-center justify-center rounded-full border-[4px] border-white shadow-lg transition-transform active:scale-90">
+          <button
+            onPointerDown={(e) => { e.preventDefault(); capturePhoto() }}
+            style={{ touchAction: 'none' }}
+            className="flex h-[72px] w-[72px] items-center justify-center rounded-full border-[4px] border-white shadow-lg transition-transform active:scale-90"
+          >
             <div className="h-[56px] w-[56px] rounded-full bg-white" />
           </button>
           {pages.length > 0 ? (

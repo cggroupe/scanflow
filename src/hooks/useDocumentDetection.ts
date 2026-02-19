@@ -19,8 +19,9 @@ export function useDocumentDetection({
 }: UseDocumentDetectionOptions) {
   const [corners, setCorners] = useState<DocumentCorners | null>(null)
   const [cvReady, setCvReady] = useState(isOpenCVReady())
-  const rafRef = useRef<number>(0)
-  const lastDetectionTime = useRef(0)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pausedRef = useRef(false)
+  const lastCornersRef = useRef<DocumentCorners | null>(null)
   // Reuse one canvas across frames to avoid GC pressure
   const detectCanvasRef = useRef<HTMLCanvasElement | null>(null)
 
@@ -38,36 +39,56 @@ export function useDocumentDetection({
     return () => clearTimeout(timer)
   }, [enabled, cvReady])
 
-  // Detection loop — 5fps on 320px canvas (lightweight)
+  // Detection loop — uses setTimeout (NOT requestAnimationFrame) at ~1fps
+  // This keeps the main thread free for touch events on mobile
   useEffect(() => {
     if (!enabled || !cvReady) {
       setCorners(null)
+      lastCornersRef.current = null
       return
     }
 
-    const interval = 200 // 5fps
+    let stopped = false
 
     function detect() {
-      rafRef.current = requestAnimationFrame(detect)
+      if (stopped) return
 
-      const now = performance.now()
-      if (now - lastDetectionTime.current < interval) return
-      lastDetectionTime.current = now
+      // Schedule next detection FIRST — even if this one fails, loop continues
+      timerRef.current = setTimeout(detect, 1000)
+
+      // Skip if paused (during capture)
+      if (pausedRef.current) return
 
       const video = videoRef.current
       if (!video || video.videoWidth === 0 || video.readyState < 2) return
 
       try {
         const result = detectDocument(video, detectCanvasRef)
+
+        // Only update state if corners actually changed (avoids unnecessary re-renders)
+        const prev = lastCornersRef.current
+        if (result === null && prev === null) return
+        if (result && prev && cornersEqual(result, prev)) return
+
+        lastCornersRef.current = result
         setCorners(result)
       } catch {
         // OpenCV error, ignore — A4 frame stays
       }
     }
 
-    rafRef.current = requestAnimationFrame(detect)
-    return () => cancelAnimationFrame(rafRef.current)
+    // Start first detection after a short delay
+    timerRef.current = setTimeout(detect, 500)
+
+    return () => {
+      stopped = true
+      if (timerRef.current) clearTimeout(timerRef.current)
+    }
   }, [enabled, cvReady, videoRef])
+
+  // Pause/resume detection (call pause before capture, resume after)
+  const pause = useCallback(() => { pausedRef.current = true }, [])
+  const resume = useCallback(() => { pausedRef.current = false }, [])
 
   const perspectiveCorrect = useCallback(
     (video: HTMLVideoElement, detectedCorners: DocumentCorners): HTMLCanvasElement => {
@@ -76,7 +97,16 @@ export function useDocumentDetection({
     [],
   )
 
-  return { corners, cvReady, perspectiveCorrect }
+  return { corners, cvReady, perspectiveCorrect, pause, resume }
+}
+
+/** Check if two corner sets are approximately equal (within 2px tolerance) */
+function cornersEqual(a: DocumentCorners, b: DocumentCorners): boolean {
+  const tol = 2
+  for (const key of ['topLeft', 'topRight', 'bottomRight', 'bottomLeft'] as const) {
+    if (Math.abs(a[key].x - b[key].x) > tol || Math.abs(a[key].y - b[key].y) > tol) return false
+  }
+  return true
 }
 
 // --- Internal detection pipeline ---
