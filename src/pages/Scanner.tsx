@@ -2,7 +2,6 @@ import { useState, useRef, useEffect, useMemo, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import ResultScreen from '@/components/ResultScreen/ResultScreen'
-import { useDocumentDetection } from '@/hooks/useDocumentDetection'
 import { imagesToPdf, toBlob } from '@/lib/pdf'
 import { useDocumentStore } from '@/stores/documentStore'
 
@@ -239,11 +238,6 @@ export default function Scanner() {
   const [editAdj, setEditAdj] = useState<Adjustments>(DEFAULT_ADJ)
   const [editPreviewUrl, setEditPreviewUrl] = useState('')
 
-  // OpenCV loads lazily 2s after camera opens — used at capture time only (no real-time loop)
-  const { cvReady, detectAndCrop } = useDocumentDetection({
-    enabled: phase === 'camera',
-  })
-
   // Cleanup on unmount
   useEffect(() => () => {
     if (videoRef.current) {
@@ -363,29 +357,21 @@ export default function Scanner() {
 
   // ---- Capture: 100% synchronous, no async/await/toBlob ----
   function capturePhoto() {
-    const video = videoRef.current
-    const container = videoContainerRef.current
-    if (!video || !container) return
-
-    // Flash feedback
+    // Flash FIRST — even before checks — so user sees something happened
     setShowFlash(true)
     setTimeout(() => setShowFlash(false), 200)
 
+    const video = videoRef.current
+    const container = videoContainerRef.current
+    if (!video || !container) {
+      setCameraError('Camera not ready')
+      setTimeout(() => setCameraError(null), 3000)
+      return
+    }
+
     try {
-      // Step 1: Try OpenCV auto-detect + perspective correction (one-shot, not looped)
-      // Falls back to A4 frame crop if OpenCV not loaded or no document found
-      let rawCanvas: HTMLCanvasElement
-      if (cvReady) {
-        const detected = detectAndCrop(video)
-        rawCanvas = detected ?? cropFrame(video, container)
-      } else {
-        rawCanvas = cropFrame(video, container)
-      }
-
-      // Step 2: Apply filters (synchronous)
+      const rawCanvas = cropFrame(video, container)
       const processed = processDocumentScan(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
-
-      // Step 3: Convert to file via toDataURL (synchronous, works everywhere)
       const { file, thumbnailUrl } = canvasToFileSync(processed)
 
       const id = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
@@ -398,13 +384,10 @@ export default function Scanner() {
         processedFile: file,
         thumbnailUrl,
       }])
-    } catch {
-      // Show brief error on camera screen
-      setCameraError(t('scanner.cameraError'))
-      setTimeout(() => setCameraError(null), 3000)
+    } catch (err) {
+      setCameraError(err instanceof Error ? err.message : t('scanner.cameraError'))
+      setTimeout(() => setCameraError(null), 5000)
     }
-
-    // DON'T leave camera — user keeps shooting
   }
 
   /** Crop video to the A4 frame area, with fallback for 0-dimension edge cases */
@@ -652,7 +635,7 @@ export default function Scanner() {
           {/* Guide text */}
           <div className="absolute bottom-3 left-0 right-0 z-20 text-center">
             <span className="rounded-full bg-black/50 px-4 py-1.5 text-xs font-medium text-white/90">
-              {cvReady ? t('scanner.autoDetectReady') : t('scanner.alignDocument')}
+              {t('scanner.alignDocument')}
             </span>
           </div>
         </div>
@@ -675,11 +658,10 @@ export default function Scanner() {
             {t('common.cancel')}
           </button>
           <button
-            onPointerDown={(e) => { e.preventDefault(); capturePhoto() }}
-            style={{ touchAction: 'none' }}
+            onClick={capturePhoto}
             className="flex h-[72px] w-[72px] items-center justify-center rounded-full border-[4px] border-white shadow-lg transition-transform active:scale-90"
           >
-            <div className="h-[56px] w-[56px] rounded-full bg-white" />
+            <div className="pointer-events-none h-[56px] w-[56px] rounded-full bg-white" />
           </button>
           {pages.length > 0 ? (
             <button onClick={handleCameraDone} className="min-w-[64px] rounded-lg bg-primary/20 px-3 py-2 text-sm font-bold text-primary active:bg-primary/30">
