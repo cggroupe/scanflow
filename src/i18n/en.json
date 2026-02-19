@@ -186,6 +186,7 @@
     "filter_highContrast": "Contrast",
     "alignDocument": "Align the document within the frame",
     "documentDetected": "Document detected",
+    "autoDetectReady": "Auto-crop enabled",
     "addPage": "Add page",
     "scanned": "scanned",
     "tapToEdit": "Tap a page to adjust settings",

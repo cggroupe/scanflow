@@ -224,7 +224,6 @@ export default function Scanner() {
   const videoContainerRef = useRef<HTMLDivElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const importRef = useRef<HTMLInputElement | null>(null)
-  const overlayCanvasRef = useRef<HTMLCanvasElement>(null)
   const autoOpenDone = useRef(false)
 
   const [phase, setPhase] = useState<Phase>('home')
@@ -240,9 +239,8 @@ export default function Scanner() {
   const [editAdj, setEditAdj] = useState<Adjustments>(DEFAULT_ADJ)
   const [editPreviewUrl, setEditPreviewUrl] = useState('')
 
-  // Document detection (OpenCV loads lazily 2s after camera opens)
-  const { corners, cvReady, perspectiveCorrect, pause: pauseDetection, resume: resumeDetection } = useDocumentDetection({
-    videoRef,
+  // OpenCV loads lazily 2s after camera opens — used at capture time only (no real-time loop)
+  const { cvReady, detectAndCrop } = useDocumentDetection({
     enabled: phase === 'camera',
   })
 
@@ -279,87 +277,6 @@ export default function Scanner() {
     const processed = processDocumentScan(editPreviewCanvas, editFilter, editAdj)
     setEditPreviewUrl(processed.toDataURL('image/jpeg', 0.85))
   }, [phase, editPreviewCanvas, editFilter, editAdj])
-
-  // Draw detected document outline on overlay canvas
-  useEffect(() => {
-    const canvas = overlayCanvasRef.current
-    const container = videoContainerRef.current
-    if (!canvas || !container || phase !== 'camera') return
-
-    const ctx = canvas.getContext('2d')!
-    canvas.width = container.clientWidth
-    canvas.height = container.clientHeight
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
-
-    if (!corners) return
-
-    const video = videoRef.current
-    if (!video || video.videoWidth === 0) return
-
-    const cW = container.clientWidth
-    const cH = container.clientHeight
-    const vW = video.videoWidth
-    const vH = video.videoHeight
-    const cAspect = cW / cH
-    const vAspect = vW / vH
-
-    let renderW: number, renderH: number, offX: number, offY: number
-    if (vAspect > cAspect) {
-      renderH = cH; renderW = cH * vAspect
-      offX = -(renderW - cW) / 2; offY = 0
-    } else {
-      renderW = cW; renderH = cW / vAspect
-      offX = 0; offY = -(renderH - cH) / 2
-    }
-    const scaleX = renderW / vW
-    const scaleY = renderH / vH
-
-    function toScreen(pt: { x: number; y: number }) {
-      return { x: pt.x * scaleX + offX, y: pt.y * scaleY + offY }
-    }
-
-    const tl = toScreen(corners.topLeft)
-    const tr = toScreen(corners.topRight)
-    const br = toScreen(corners.bottomRight)
-    const bl = toScreen(corners.bottomLeft)
-
-    // Semi-transparent overlay outside document
-    ctx.fillStyle = 'rgba(0,0,0,0.4)'
-    ctx.fillRect(0, 0, canvas.width, canvas.height)
-
-    // Cut out document area
-    ctx.globalCompositeOperation = 'destination-out'
-    ctx.beginPath()
-    ctx.moveTo(tl.x, tl.y)
-    ctx.lineTo(tr.x, tr.y)
-    ctx.lineTo(br.x, br.y)
-    ctx.lineTo(bl.x, bl.y)
-    ctx.closePath()
-    ctx.fill()
-    ctx.globalCompositeOperation = 'source-over'
-
-    // Green border
-    ctx.strokeStyle = '#22c55e'
-    ctx.lineWidth = 3
-    ctx.beginPath()
-    ctx.moveTo(tl.x, tl.y)
-    ctx.lineTo(tr.x, tr.y)
-    ctx.lineTo(br.x, br.y)
-    ctx.lineTo(bl.x, bl.y)
-    ctx.closePath()
-    ctx.stroke()
-
-    // Corner dots
-    for (const pt of [tl, tr, br, bl]) {
-      ctx.beginPath()
-      ctx.arc(pt.x, pt.y, 6, 0, Math.PI * 2)
-      ctx.fillStyle = '#22c55e'
-      ctx.fill()
-      ctx.strokeStyle = '#fff'
-      ctx.lineWidth = 2
-      ctx.stroke()
-    }
-  }, [corners, phase])
 
   // ---- Camera ----
   const openCamera = useCallback(async () => {
@@ -450,22 +367,17 @@ export default function Scanner() {
     const container = videoContainerRef.current
     if (!video || !container) return
 
-    // Pause OpenCV detection during capture to free up the main thread
-    pauseDetection()
-
     // Flash feedback
     setShowFlash(true)
     setTimeout(() => setShowFlash(false), 200)
 
     try {
-      // Step 1: Capture raw frame
+      // Step 1: Try OpenCV auto-detect + perspective correction (one-shot, not looped)
+      // Falls back to A4 frame crop if OpenCV not loaded or no document found
       let rawCanvas: HTMLCanvasElement
-      if (corners && cvReady) {
-        try {
-          rawCanvas = perspectiveCorrect(video, corners)
-        } catch {
-          rawCanvas = cropFrame(video, container)
-        }
+      if (cvReady) {
+        const detected = detectAndCrop(video)
+        rawCanvas = detected ?? cropFrame(video, container)
       } else {
         rawCanvas = cropFrame(video, container)
       }
@@ -491,9 +403,6 @@ export default function Scanner() {
       setCameraError(t('scanner.cameraError'))
       setTimeout(() => setCameraError(null), 3000)
     }
-
-    // Resume detection after a short delay (let UI update first)
-    setTimeout(() => resumeDetection(), 300)
 
     // DON'T leave camera — user keeps shooting
   }
@@ -708,26 +617,19 @@ export default function Scanner() {
         <div ref={videoContainerRef} className="relative flex-1 overflow-hidden">
           <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover" />
 
-          {/* Document detection overlay or A4 guide fallback */}
-          {corners ? (
-            <canvas
-              ref={overlayCanvasRef}
-              className="pointer-events-none absolute inset-0 z-10"
-            />
-          ) : (
-            <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-              <div
-                className="relative"
-                style={{ width: '80%', aspectRatio: '210 / 297', boxShadow: '0 0 0 9999px rgba(0,0,0,0.4)', borderRadius: '8px' }}
-              >
-                <div className="absolute inset-0 rounded-lg border border-white/50" />
-                <div className="absolute -left-px -top-px h-7 w-7 rounded-tl-lg border-l-[3px] border-t-[3px] border-primary" />
-                <div className="absolute -right-px -top-px h-7 w-7 rounded-tr-lg border-r-[3px] border-t-[3px] border-primary" />
-                <div className="absolute -bottom-px -left-px h-7 w-7 rounded-bl-lg border-b-[3px] border-l-[3px] border-primary" />
-                <div className="absolute -bottom-px -right-px h-7 w-7 rounded-br-lg border-b-[3px] border-r-[3px] border-primary" />
-              </div>
+          {/* A4 guide frame */}
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+            <div
+              className="relative"
+              style={{ width: '80%', aspectRatio: '210 / 297', boxShadow: '0 0 0 9999px rgba(0,0,0,0.4)', borderRadius: '8px' }}
+            >
+              <div className="absolute inset-0 rounded-lg border border-white/50" />
+              <div className="absolute -left-px -top-px h-7 w-7 rounded-tl-lg border-l-[3px] border-t-[3px] border-primary" />
+              <div className="absolute -right-px -top-px h-7 w-7 rounded-tr-lg border-r-[3px] border-t-[3px] border-primary" />
+              <div className="absolute -bottom-px -left-px h-7 w-7 rounded-bl-lg border-b-[3px] border-l-[3px] border-primary" />
+              <div className="absolute -bottom-px -right-px h-7 w-7 rounded-br-lg border-b-[3px] border-r-[3px] border-primary" />
             </div>
-          )}
+          </div>
 
           {/* Flash */}
           <div className={`pointer-events-none absolute inset-0 z-10 bg-white transition-opacity duration-200 ease-out ${showFlash ? 'opacity-70' : 'opacity-0'}`} />
@@ -750,7 +652,7 @@ export default function Scanner() {
           {/* Guide text */}
           <div className="absolute bottom-3 left-0 right-0 z-20 text-center">
             <span className="rounded-full bg-black/50 px-4 py-1.5 text-xs font-medium text-white/90">
-              {corners ? t('scanner.documentDetected') : t('scanner.alignDocument')}
+              {cvReady ? t('scanner.autoDetectReady') : t('scanner.alignDocument')}
             </span>
           </div>
         </div>

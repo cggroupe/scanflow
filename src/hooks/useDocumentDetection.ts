@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { loadOpenCV, isOpenCVReady } from '@/lib/opencv-loader'
 
 export interface DocumentCorners {
@@ -9,124 +9,66 @@ export interface DocumentCorners {
 }
 
 interface UseDocumentDetectionOptions {
-  videoRef: React.RefObject<HTMLVideoElement | null>
   enabled: boolean
 }
 
-export function useDocumentDetection({
-  videoRef,
-  enabled,
-}: UseDocumentDetectionOptions) {
-  const [corners, setCorners] = useState<DocumentCorners | null>(null)
+/**
+ * Hook that loads OpenCV lazily and exposes a one-shot detectAndCrop function.
+ *
+ * NO real-time detection loop — OpenCV is too heavy for mobile main thread.
+ * Instead: always show the A4 guide frame, and at capture time, run OpenCV
+ * once to detect document edges and auto-crop with perspective correction.
+ */
+export function useDocumentDetection({ enabled }: UseDocumentDetectionOptions) {
   const [cvReady, setCvReady] = useState(isOpenCVReady())
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const pausedRef = useRef(false)
-  const lastCornersRef = useRef<DocumentCorners | null>(null)
-  // Reuse one canvas across frames to avoid GC pressure
-  const detectCanvasRef = useRef<HTMLCanvasElement | null>(null)
 
   // Load OpenCV LAZILY — only when camera is active, with 2s delay
-  // This prevents the 8MB script from freezing the page on mount
   useEffect(() => {
     if (!enabled || cvReady) return
 
     const timer = setTimeout(() => {
       loadOpenCV()
         .then(() => setCvReady(true))
-        .catch(() => {}) // silent fail → A4 frame stays
+        .catch(() => {}) // silent fail → A4 crop fallback
     }, 2000)
 
     return () => clearTimeout(timer)
   }, [enabled, cvReady])
 
-  // Detection loop — uses setTimeout (NOT requestAnimationFrame) at ~1fps
-  // This keeps the main thread free for touch events on mobile
-  useEffect(() => {
-    if (!enabled || !cvReady) {
-      setCorners(null)
-      lastCornersRef.current = null
-      return
-    }
-
-    let stopped = false
-
-    function detect() {
-      if (stopped) return
-
-      // Schedule next detection FIRST — even if this one fails, loop continues
-      timerRef.current = setTimeout(detect, 1000)
-
-      // Skip if paused (during capture)
-      if (pausedRef.current) return
-
-      const video = videoRef.current
-      if (!video || video.videoWidth === 0 || video.readyState < 2) return
+  /**
+   * Detect document in a video frame and return a perspective-corrected canvas.
+   * Returns null if no document found (caller should fall back to A4 crop).
+   * Runs synchronously — call only at capture time, not in a loop.
+   */
+  const detectAndCrop = useCallback(
+    (video: HTMLVideoElement): HTMLCanvasElement | null => {
+      if (!isOpenCVReady()) return null
 
       try {
-        const result = detectDocument(video, detectCanvasRef)
-
-        // Only update state if corners actually changed (avoids unnecessary re-renders)
-        const prev = lastCornersRef.current
-        if (result === null && prev === null) return
-        if (result && prev && cornersEqual(result, prev)) return
-
-        lastCornersRef.current = result
-        setCorners(result)
+        const corners = detectDocument(video)
+        if (!corners) return null
+        return applyPerspectiveCorrection(video, corners)
       } catch {
-        // OpenCV error, ignore — A4 frame stays
+        return null
       }
-    }
-
-    // Start first detection after a short delay
-    timerRef.current = setTimeout(detect, 500)
-
-    return () => {
-      stopped = true
-      if (timerRef.current) clearTimeout(timerRef.current)
-    }
-  }, [enabled, cvReady, videoRef])
-
-  // Pause/resume detection (call pause before capture, resume after)
-  const pause = useCallback(() => { pausedRef.current = true }, [])
-  const resume = useCallback(() => { pausedRef.current = false }, [])
-
-  const perspectiveCorrect = useCallback(
-    (video: HTMLVideoElement, detectedCorners: DocumentCorners): HTMLCanvasElement => {
-      return applyPerspectiveCorrection(video, detectedCorners)
     },
     [],
   )
 
-  return { corners, cvReady, perspectiveCorrect, pause, resume }
-}
-
-/** Check if two corner sets are approximately equal (within 2px tolerance) */
-function cornersEqual(a: DocumentCorners, b: DocumentCorners): boolean {
-  const tol = 2
-  for (const key of ['topLeft', 'topRight', 'bottomRight', 'bottomLeft'] as const) {
-    if (Math.abs(a[key].x - b[key].x) > tol || Math.abs(a[key].y - b[key].y) > tol) return false
-  }
-  return true
+  return { cvReady, detectAndCrop }
 }
 
 // --- Internal detection pipeline ---
 
-function detectDocument(
-  video: HTMLVideoElement,
-  canvasRef: React.MutableRefObject<HTMLCanvasElement | null>,
-): DocumentCorners | null {
+function detectDocument(video: HTMLVideoElement): DocumentCorners | null {
   const cv = window.cv
 
-  // Scale down to max 320px wide (4x less work than 640px)
+  // Scale down to 320px wide for fast processing
   const scale = Math.min(1, 320 / video.videoWidth)
   const w = Math.round(video.videoWidth * scale)
   const h = Math.round(video.videoHeight * scale)
 
-  // Reuse canvas element across frames
-  if (!canvasRef.current) {
-    canvasRef.current = document.createElement('canvas')
-  }
-  const canvas = canvasRef.current
+  const canvas = document.createElement('canvas')
   canvas.width = w
   canvas.height = h
   canvas.getContext('2d')!.drawImage(video, 0, 0, w, h)
@@ -152,7 +94,7 @@ function detectDocument(
 
     let bestContour: any = null
     let bestArea = 0
-    const minArea = w * h * 0.1 // document must be at least 10% of frame
+    const minArea = w * h * 0.1
 
     for (let i = 0; i < contours.size(); i++) {
       const contour = contours.get(i)
@@ -177,7 +119,6 @@ function detectDocument(
 
     if (!bestContour) return null
 
-    // Extract 4 points and sort them
     const points: Array<{ x: number; y: number }> = []
     for (let i = 0; i < 4; i++) {
       points.push({
@@ -197,7 +138,6 @@ function detectDocument(
 }
 
 function orderCorners(points: Array<{ x: number; y: number }>): DocumentCorners {
-  // Sort by sum (x+y) to find TL and BR, diff (x-y) to find TR and BL
   const bySum = [...points].sort((a, b) => (a.x + a.y) - (b.x + b.y))
   const topLeft = bySum[0]
   const bottomRight = bySum[3]
@@ -215,14 +155,12 @@ function applyPerspectiveCorrection(
 ): HTMLCanvasElement {
   const cv = window.cv
 
-  // Capture full-resolution frame
   const srcCanvas = document.createElement('canvas')
   srcCanvas.width = video.videoWidth
   srcCanvas.height = video.videoHeight
   srcCanvas.getContext('2d')!.drawImage(video, 0, 0)
   const src = cv.imread(srcCanvas)
 
-  // Calculate output dimensions
   const widthTop = Math.hypot(corners.topRight.x - corners.topLeft.x, corners.topRight.y - corners.topLeft.y)
   const widthBottom = Math.hypot(corners.bottomRight.x - corners.bottomLeft.x, corners.bottomRight.y - corners.bottomLeft.y)
   const heightLeft = Math.hypot(corners.bottomLeft.x - corners.topLeft.x, corners.bottomLeft.y - corners.topLeft.y)
