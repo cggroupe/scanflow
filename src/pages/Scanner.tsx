@@ -378,12 +378,19 @@ export default function Scanner() {
     try {
       // Try auto-detect via Web Worker (runs in background thread, non-blocking)
       let rawCanvas: HTMLCanvasElement
+      let debugInfo = 'no opencv'
+
       if (cvReady) {
-        const detected = await detectAndCrop(video)
-        rawCanvas = detected ?? cropFrame(video, container)
+        const result = await detectAndCrop(video)
+        debugInfo = result.debug
+        rawCanvas = result.canvas ?? cropFrame(video, container)
       } else {
         rawCanvas = cropFrame(video, container)
       }
+
+      // Show debug info briefly so user can report what happened
+      setCameraError(debugInfo)
+      setTimeout(() => setCameraError(null), 3000)
 
       const processed = processDocumentScan(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
       const { file, thumbnailUrl } = canvasToFileSync(processed)

@@ -2,49 +2,75 @@
 /**
  * OpenCV Web Worker — runs document detection in a background thread.
  * The main thread is NEVER blocked, so buttons always respond.
- *
- * Protocol:
- *   Main → Worker: { type: 'detect', pixels: Uint8ClampedArray, width, height }
- *   Worker → Main: { type: 'ready' }
- *   Worker → Main: { type: 'result', detected: true, pixels, width, height }
- *   Worker → Main: { type: 'result', detected: false }
  */
 
 var cvReady = false;
+var cv = null;
 
 var Module = {
   onRuntimeInitialized: function () {
-    cvReady = true;
-    postMessage({ type: 'ready' });
+    // OpenCV.js sets cv differently depending on environment
+    // In a Worker: try self.cv, then Module itself
+    cv = self.cv || self.Module || Module;
+
+    if (cv && typeof cv.Mat === 'function') {
+      cvReady = true;
+      postMessage({ type: 'ready' });
+    } else {
+      postMessage({ type: 'error', message: 'OpenCV loaded but cv.Mat not found' });
+    }
   },
 };
 
 try {
   importScripts('https://docs.opencv.org/4.9.0/opencv.js');
+  // Some builds set cv synchronously after importScripts
+  if (!cvReady && !cv) {
+    cv = self.cv || self.Module || Module;
+    if (cv && typeof cv.Mat === 'function') {
+      cvReady = true;
+      postMessage({ type: 'ready' });
+    }
+  }
 } catch (e) {
-  postMessage({ type: 'error', message: 'Failed to load OpenCV: ' + e.message });
+  postMessage({ type: 'error', message: 'importScripts failed: ' + e.message });
 }
 
 onmessage = function (e) {
   if (e.data.type !== 'detect') return;
 
-  if (!cvReady) {
-    postMessage({ type: 'result', detected: false });
+  if (!cvReady || !cv) {
+    postMessage({ type: 'result', detected: false, debug: 'cv not ready' });
     return;
   }
 
   try {
-    var result = detectAndCrop(e.data.pixels, e.data.width, e.data.height);
+    var pixels = e.data.pixels;
+    var width = e.data.width;
+    var height = e.data.height;
+
+    if (!pixels || !pixels.length) {
+      postMessage({ type: 'result', detected: false, debug: 'no pixel data received' });
+      return;
+    }
+
+    var expectedLen = width * height * 4;
+    if (pixels.length !== expectedLen) {
+      postMessage({ type: 'result', detected: false, debug: 'pixel length mismatch: got ' + pixels.length + ' expected ' + expectedLen });
+      return;
+    }
+
+    var result = detectAndCrop(pixels, width, height);
     if (result) {
       postMessage(
-        { type: 'result', detected: true, pixels: result.pixels, width: result.width, height: result.height },
+        { type: 'result', detected: true, pixels: result.pixels, width: result.width, height: result.height, debug: result.debug },
         [result.pixels.buffer]
       );
     } else {
-      postMessage({ type: 'result', detected: false });
+      postMessage({ type: 'result', detected: false, debug: 'no document found' });
     }
   } catch (err) {
-    postMessage({ type: 'result', detected: false, error: err.message });
+    postMessage({ type: 'result', detected: false, debug: 'error: ' + err.message });
   }
 };
 
@@ -59,7 +85,11 @@ function detectAndCrop(pixels, width, height) {
   try {
     var corners = findDocumentCorners(src, width, height);
     if (!corners) return null;
-    return perspectiveCorrect(src, corners);
+    var corrected = perspectiveCorrect(src, corners.points);
+    if (corrected) {
+      corrected.debug = 'detected: contours=' + corners.contourCount + ' area=' + Math.round(corners.bestArea);
+    }
+    return corrected;
   } finally {
     src.delete();
   }
@@ -79,53 +109,67 @@ function findDocumentCorners(src, width, height) {
     cv.resize(src, small, new cv.Size(sw, sh));
     cv.cvtColor(small, gray, cv.COLOR_RGBA2GRAY);
     cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
-    cv.Canny(blurred, edges, 50, 150);
 
-    var kernel = cv.Mat.ones(3, 3, cv.CV_8U);
-    cv.dilate(edges, edges, kernel);
-    kernel.delete();
+    // Try multiple Canny threshold pairs (more tolerant on second pass)
+    var thresholds = [
+      [50, 150],
+      [30, 100],
+      [75, 200],
+    ];
 
-    var contours = new cv.MatVector();
-    var hierarchy = new cv.Mat();
-    cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    var totalContours = 0;
 
-    var bestContour = null;
-    var bestArea = 0;
-    var minArea = sw * sh * 0.1;
+    for (var t = 0; t < thresholds.length; t++) {
+      cv.Canny(blurred, edges, thresholds[t][0], thresholds[t][1]);
 
-    for (var i = 0; i < contours.size(); i++) {
-      var contour = contours.get(i);
-      var area = cv.contourArea(contour);
-      if (area < minArea) continue;
+      var kernel = cv.Mat.ones(3, 3, cv.CV_8U);
+      cv.dilate(edges, edges, kernel);
+      kernel.delete();
 
-      var peri = cv.arcLength(contour, true);
-      var approx = new cv.Mat();
-      cv.approxPolyDP(contour, approx, 0.02 * peri, true);
+      var contours = new cv.MatVector();
+      var hierarchy = new cv.Mat();
+      cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-      if (approx.rows === 4 && area > bestArea) {
-        if (bestContour) bestContour.delete();
-        bestContour = approx;
-        bestArea = area;
-      } else {
-        approx.delete();
+      var bestContour = null;
+      var bestArea = 0;
+      var minArea = sw * sh * 0.05; // Lowered to 5% (was 10%)
+      totalContours += contours.size();
+
+      for (var i = 0; i < contours.size(); i++) {
+        var contour = contours.get(i);
+        var area = cv.contourArea(contour);
+        if (area < minArea) continue;
+
+        var peri = cv.arcLength(contour, true);
+        var approx = new cv.Mat();
+        cv.approxPolyDP(contour, approx, 0.02 * peri, true);
+
+        if (approx.rows === 4 && area > bestArea) {
+          if (bestContour) bestContour.delete();
+          bestContour = approx;
+          bestArea = area;
+        } else {
+          approx.delete();
+        }
+      }
+
+      contours.delete();
+      hierarchy.delete();
+
+      if (bestContour) {
+        var points = [];
+        for (var j = 0; j < 4; j++) {
+          points.push({
+            x: bestContour.data32S[j * 2] / scale,
+            y: bestContour.data32S[j * 2 + 1] / scale,
+          });
+        }
+        bestContour.delete();
+        return { points: orderCorners(points), contourCount: totalContours, bestArea: bestArea };
       }
     }
 
-    contours.delete();
-    hierarchy.delete();
-
-    if (!bestContour) return null;
-
-    var points = [];
-    for (var j = 0; j < 4; j++) {
-      points.push({
-        x: bestContour.data32S[j * 2] / scale,
-        y: bestContour.data32S[j * 2 + 1] / scale,
-      });
-    }
-    bestContour.delete();
-
-    return orderCorners(points);
+    return null;
   } finally {
     small.delete();
     gray.delete();
@@ -143,7 +187,7 @@ function perspectiveCorrect(src, corners) {
   var outW = Math.round(Math.max(widthTop, widthBottom));
   var outH = Math.round(Math.max(heightLeft, heightRight));
 
-  if (outW < 100 || outH < 100) return null;
+  if (outW < 50 || outH < 50) return null;
 
   var srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
     corners.topLeft.x, corners.topLeft.y,

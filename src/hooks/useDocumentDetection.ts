@@ -4,19 +4,21 @@ interface UseDocumentDetectionOptions {
   enabled: boolean
 }
 
+interface DetectResult {
+  canvas: HTMLCanvasElement | null
+  debug: string
+}
+
 /**
  * Hook that runs OpenCV document detection in a Web Worker.
  *
  * The Worker loads OpenCV.js (8MB) in a background thread — the main thread
  * is NEVER blocked, so buttons always respond on mobile.
- *
- * Exposes detectAndCrop(video) which sends a video frame to the Worker,
- * waits for detection + perspective correction, and returns a canvas.
  */
 export function useDocumentDetection({ enabled }: UseDocumentDetectionOptions) {
   const [cvReady, setCvReady] = useState(false)
   const workerRef = useRef<Worker | null>(null)
-  const pendingRef = useRef<((canvas: HTMLCanvasElement | null) => void) | null>(null)
+  const pendingRef = useRef<((result: DetectResult) => void) | null>(null)
 
   // Spawn worker when camera is active, terminate when not
   useEffect(() => {
@@ -32,32 +34,40 @@ export function useDocumentDetection({ enabled }: UseDocumentDetectionOptions) {
 
       if (e.data.type === 'ready') {
         setCvReady(true)
+      } else if (e.data.type === 'error') {
+        // OpenCV load failed — log debug but don't crash
+        console.warn('[OpenCV Worker]', e.data.message)
       } else if (e.data.type === 'result') {
         const resolve = pendingRef.current
         if (!resolve) return
         pendingRef.current = null
 
+        const debug = e.data.debug || ''
+
         if (e.data.detected && e.data.pixels) {
-          // Reconstruct canvas from pixel data returned by worker
-          const canvas = document.createElement('canvas')
-          canvas.width = e.data.width
-          canvas.height = e.data.height
-          const ctx = canvas.getContext('2d')!
-          const imgData = new ImageData(
-            new Uint8ClampedArray(e.data.pixels),
-            e.data.width,
-            e.data.height,
-          )
-          ctx.putImageData(imgData, 0, 0)
-          resolve(canvas)
+          try {
+            const canvas = document.createElement('canvas')
+            canvas.width = e.data.width
+            canvas.height = e.data.height
+            const ctx = canvas.getContext('2d')!
+            const imgData = new ImageData(
+              new Uint8ClampedArray(e.data.pixels),
+              e.data.width,
+              e.data.height,
+            )
+            ctx.putImageData(imgData, 0, 0)
+            resolve({ canvas, debug })
+          } catch {
+            resolve({ canvas: null, debug: 'canvas reconstruction failed' })
+          }
         } else {
-          resolve(null)
+          resolve({ canvas: null, debug })
         }
       }
     }
 
-    worker.onerror = () => {
-      // OpenCV failed to load — silent fail, A4 crop fallback
+    worker.onerror = (err) => {
+      console.warn('[OpenCV Worker error]', err.message)
     }
 
     return () => {
@@ -71,46 +81,47 @@ export function useDocumentDetection({ enabled }: UseDocumentDetectionOptions) {
 
   /**
    * Send a video frame to the Worker for detection + perspective correction.
-   * Returns a corrected canvas, or null if no document found.
-   * The video frame is captured synchronously, then processing is async in the Worker.
+   * Returns { canvas, debug } where canvas is the corrected image (or null).
    */
   const detectAndCrop = useCallback(
-    (video: HTMLVideoElement): Promise<HTMLCanvasElement | null> => {
+    (video: HTMLVideoElement): Promise<DetectResult> => {
       return new Promise((resolve) => {
         const worker = workerRef.current
         if (!worker || !cvReady) {
-          resolve(null)
+          resolve({ canvas: null, debug: 'worker not ready' })
           return
         }
 
-        // Capture video frame NOW (synchronous — before any async gap)
         const w = video.videoWidth
         const h = video.videoHeight
         if (w === 0 || h === 0) {
-          resolve(null)
+          resolve({ canvas: null, debug: 'video has no dimensions' })
           return
         }
 
+        // Capture video frame NOW (synchronous)
         const canvas = document.createElement('canvas')
         canvas.width = w
         canvas.height = h
         canvas.getContext('2d')!.drawImage(video, 0, 0)
         const imageData = canvas.getContext('2d')!.getImageData(0, 0, w, h)
 
-        // Register callback for when worker responds
+        // Copy pixels before transferring (ensures clean transfer)
+        const pixelsCopy = new Uint8ClampedArray(imageData.data)
+
         pendingRef.current = resolve
 
-        // Send pixel data to worker (transferable = zero-copy)
+        // Send copied pixel data to worker (transfer the copy's buffer)
         worker.postMessage(
-          { type: 'detect', pixels: imageData.data, width: w, height: h },
-          [imageData.data.buffer],
+          { type: 'detect', pixels: pixelsCopy, width: w, height: h },
+          [pixelsCopy.buffer],
         )
 
-        // Safety timeout — if worker doesn't respond in 5s, fall back to A4 crop
+        // Safety timeout
         setTimeout(() => {
           if (pendingRef.current === resolve) {
             pendingRef.current = null
-            resolve(null)
+            resolve({ canvas: null, debug: 'timeout (5s)' })
           }
         }, 5000)
       })
