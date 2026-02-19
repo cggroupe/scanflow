@@ -158,10 +158,10 @@ function sharpenCanvas(canvas: HTMLCanvasElement, amount: number) {
 
 /** Process a raw canvas and return a File + thumbnail URL */
 function processAndCreateFile(raw: HTMLCanvasElement, filter: Filter, adj: Adjustments): Promise<{ file: File; url: string }> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const processed = processDocumentScan(raw, filter, adj)
     processed.toBlob((blob) => {
-      if (!blob) return
+      if (!blob) { reject(new Error('Blob creation failed')); return }
       const file = new File([blob], `scan_${Date.now()}.jpg`, { type: 'image/jpeg' })
       resolve({ file, url: URL.createObjectURL(blob) })
     }, 'image/jpeg', 0.92)
@@ -207,6 +207,7 @@ export default function Scanner() {
   const streamRef = useRef<MediaStream | null>(null)
   const importRef = useRef<HTMLInputElement | null>(null)
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null)
+  const autoOpenDone = useRef(false)
 
   const [phase, setPhase] = useState<Phase>('home')
   const [pages, setPages] = useState<ScannedPage[]>([])
@@ -234,14 +235,6 @@ export default function Scanner() {
     }
     streamRef.current?.getTracks().forEach((tr) => tr.stop())
     streamRef.current = null
-  }, [])
-
-  // Auto-open camera if ?mode=camera
-  useEffect(() => {
-    if (searchParams.get('mode') === 'camera' && phase === 'home') {
-      openCamera()
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Editing page reference
@@ -411,9 +404,18 @@ export default function Scanner() {
         streamRef.current.getTracks().forEach((tr) => tr.stop())
         streamRef.current = null
       }
+      setPhase('home')
       setCameraError(t('scanner.cameraError'))
     }
   }, [t])
+
+  // Auto-open camera if ?mode=camera (placed AFTER openCamera definition)
+  useEffect(() => {
+    if (!autoOpenDone.current && searchParams.get('mode') === 'camera' && phase === 'home') {
+      autoOpenDone.current = true
+      openCamera()
+    }
+  }, [searchParams, phase, openCamera])
 
   function stopCamera() {
     if (videoRef.current) {
@@ -434,31 +436,43 @@ export default function Scanner() {
     setShowFlash(true)
     setTimeout(() => setShowFlash(false), 200)
 
-    let rawCanvas: HTMLCanvasElement
+    try {
+      let rawCanvas: HTMLCanvasElement
 
-    if (corners && cvReady) {
-      // Use perspective correction for bird's-eye view
-      rawCanvas = perspectiveCorrect(video, corners)
-    } else {
-      // Fallback: crop to A4 frame area
-      const { sx, sy, sw, sh } = getFrameCropRect(video, container)
-      rawCanvas = document.createElement('canvas')
-      rawCanvas.width = sw; rawCanvas.height = sh
-      rawCanvas.getContext('2d')!.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh)
+      if (corners && cvReady) {
+        try {
+          // Use perspective correction for bird's-eye view
+          rawCanvas = perspectiveCorrect(video, corners)
+        } catch {
+          // OpenCV perspective correction failed, fallback to A4 crop
+          const { sx, sy, sw, sh } = getFrameCropRect(video, container)
+          rawCanvas = document.createElement('canvas')
+          rawCanvas.width = sw; rawCanvas.height = sh
+          rawCanvas.getContext('2d')!.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh)
+        }
+      } else {
+        // Fallback: crop to A4 frame area
+        const { sx, sy, sw, sh } = getFrameCropRect(video, container)
+        rawCanvas = document.createElement('canvas')
+        rawCanvas.width = sw; rawCanvas.height = sh
+        rawCanvas.getContext('2d')!.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh)
+      }
+
+      // Auto-process with default settings (in background, stay in camera)
+      const { file, url } = await processAndCreateFile(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
+      const id = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+
+      setPages((prev) => [...prev, {
+        id,
+        rawCanvas,
+        filter: DEFAULT_FILTER,
+        adjustments: { ...DEFAULT_ADJ },
+        processedFile: file,
+        thumbnailUrl: url,
+      }])
+    } catch {
+      // Capture failed, user can retry
     }
-
-    // Auto-process with default settings (in background, stay in camera)
-    const { file, url } = await processAndCreateFile(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
-    const id = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
-
-    setPages((prev) => [...prev, {
-      id,
-      rawCanvas,
-      filter: DEFAULT_FILTER,
-      adjustments: { ...DEFAULT_ADJ },
-      processedFile: file,
-      thumbnailUrl: url,
-    }])
 
     // DON'T leave camera — user keeps shooting
   }
