@@ -180,10 +180,10 @@
     "creatingPdf": "Création du PDF en cours...",
     "done": "Terminé",
     "cameraError": "Impossible d'accéder à la caméra. Vérifiez les permissions.",
+    "filter_magicColor": "Magic Color",
     "filter_original": "Original",
-    "filter_enhance": "Améliorer",
     "filter_grayscale": "Gris",
-    "filter_highContrast": "Contraste",
+    "filter_bw": "N&B",
     "alignDocument": "Alignez le document dans le cadre",
     "documentDetected": "Document détecté",
     "autoDetectReady": "Recadrage auto activé",
@@ -198,7 +198,10 @@
     "contrast": "Contraste",
     "sharpness": "Netteté",
     "tipTitle": "Conseil",
-    "tipText": "Placez votre document sur un fond contrasté et assurez-vous d'avoir un bon éclairage pour de meilleurs résultats."
+    "tipText": "Placez votre document sur un fond contrasté et assurez-vous d'avoir un bon éclairage pour de meilleurs résultats.",
+    "manualCrop": "Ajuster le cadrage",
+    "confirmCrop": "Valider",
+    "dragCorners": "Déplacez les coins pour ajuster le cadrage du document"
   },
   "toolPage": {
     "description": "Sélectionnez vos fichiers pour commencer le traitement.",

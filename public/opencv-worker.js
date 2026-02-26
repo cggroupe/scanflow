@@ -45,10 +45,12 @@ try {
 }
 
 onmessage = function (e) {
-  if (e.data.type !== 'detect') return;
+  var msgType = e.data.type;
+
+  if (msgType !== 'detect' && msgType !== 'detect-live' && msgType !== 'crop-with-corners') return;
 
   if (!cvReady || !cv) {
-    postMessage({ type: 'result', detected: false, debug: 'cv not ready' });
+    postMessage({ type: msgType === 'detect-live' ? 'live-result' : 'result', detected: false, debug: 'cv not ready' });
     return;
   }
 
@@ -58,16 +60,62 @@ onmessage = function (e) {
     var height = e.data.height;
 
     if (!pixels || !pixels.length) {
-      postMessage({ type: 'result', detected: false, debug: 'no pixel data' });
+      postMessage({ type: msgType === 'detect-live' ? 'live-result' : 'result', detected: false, debug: 'no pixel data' });
       return;
     }
 
     var expectedLen = width * height * 4;
     if (pixels.length !== expectedLen) {
-      postMessage({ type: 'result', detected: false, debug: 'pixel mismatch' });
+      postMessage({ type: msgType === 'detect-live' ? 'live-result' : 'result', detected: false, debug: 'pixel mismatch' });
       return;
     }
 
+    // ---- detect-live: return corners only (no perspective correction) ----
+    if (msgType === 'detect-live') {
+      var imageData = new ImageData(new Uint8ClampedArray(pixels), width, height);
+      var src = cv.matFromImageData(imageData);
+      try {
+        var corners = findDocumentCorners(src, width, height);
+        if (corners) {
+          // Return corners as normalized percentages (0-1)
+          var quad = {
+            topLeft:     { x: corners.points.topLeft.x / width,     y: corners.points.topLeft.y / height },
+            topRight:    { x: corners.points.topRight.x / width,    y: corners.points.topRight.y / height },
+            bottomRight: { x: corners.points.bottomRight.x / width, y: corners.points.bottomRight.y / height },
+            bottomLeft:  { x: corners.points.bottomLeft.x / width,  y: corners.points.bottomLeft.y / height },
+          };
+          postMessage({ type: 'live-result', detected: true, quad: quad, debug: corners.debug });
+        } else {
+          postMessage({ type: 'live-result', detected: false, debug: 'no document found' });
+        }
+      } finally {
+        src.delete();
+      }
+      return;
+    }
+
+    // ---- crop-with-corners: perspective correct with given corners ----
+    if (msgType === 'crop-with-corners') {
+      var cornersInput = e.data.corners; // { topLeft, topRight, bottomRight, bottomLeft } in pixel coords
+      var imageData2 = new ImageData(new Uint8ClampedArray(pixels), width, height);
+      var src2 = cv.matFromImageData(imageData2);
+      try {
+        var corrected = perspectiveCorrect(src2, cornersInput);
+        if (corrected) {
+          postMessage(
+            { type: 'result', detected: true, pixels: corrected.pixels, width: corrected.width, height: corrected.height, debug: 'manual-crop' },
+            [corrected.pixels.buffer]
+          );
+        } else {
+          postMessage({ type: 'result', detected: false, debug: 'perspective correction failed' });
+        }
+      } finally {
+        src2.delete();
+      }
+      return;
+    }
+
+    // ---- detect: original behavior (detect + perspective correct) ----
     var result = detectAndCrop(pixels, width, height);
     if (result) {
       postMessage(
@@ -78,7 +126,7 @@ onmessage = function (e) {
       postMessage({ type: 'result', detected: false, debug: 'no document found' });
     }
   } catch (err) {
-    postMessage({ type: 'result', detected: false, debug: 'error: ' + err.message });
+    postMessage({ type: msgType === 'detect-live' ? 'live-result' : 'result', detected: false, debug: 'error: ' + err.message });
   }
 };
 

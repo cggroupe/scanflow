@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useMemo, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import ResultScreen from '@/components/ResultScreen/ResultScreen'
-import { useDocumentDetection } from '@/hooks/useDocumentDetection'
+import { useDocumentDetection, type QuadCorners } from '@/hooks/useDocumentDetection'
 import { imagesToPdf, toBlob } from '@/lib/pdf'
 import { useDocumentStore } from '@/stores/documentStore'
 
@@ -10,8 +10,8 @@ import { useDocumentStore } from '@/stores/documentStore'
 // Types
 // ================================================================
 
-type Phase = 'home' | 'camera' | 'review' | 'editPage' | 'processing' | 'done'
-type Filter = 'original' | 'enhance' | 'grayscale' | 'highContrast'
+type Phase = 'home' | 'camera' | 'crop' | 'review' | 'editPage' | 'processing' | 'done'
+type Filter = 'magicColor' | 'original' | 'grayscale' | 'bw'
 
 interface Adjustments {
   brightness: number // -60..60
@@ -21,57 +21,19 @@ interface Adjustments {
 
 interface ScannedPage {
   id: string
-  rawCanvas: HTMLCanvasElement   // original cropped capture (full-res)
+  rawCanvas: HTMLCanvasElement
   filter: Filter
   adjustments: Adjustments
-  processedFile: File            // processed JPEG
-  thumbnailUrl: string           // object URL of processed
+  processedFile: File
+  thumbnailUrl: string
 }
 
-const DEFAULT_ADJ: Adjustments = { brightness: 10, contrast: 35, sharpness: 50 }
-const DEFAULT_FILTER: Filter = 'enhance'
+const DEFAULT_ADJ: Adjustments = { brightness: 5, contrast: 20, sharpness: 40 }
+const DEFAULT_FILTER: Filter = 'magicColor'
 
 // ================================================================
-// Image processing (same pipeline as before)
+// Image processing — Magic Color (CamScanner-style per-channel percentile stretching)
 // ================================================================
-
-function getFrameCropRect(video: HTMLVideoElement, container: HTMLElement) {
-  const cW = container.clientWidth
-  const cH = container.clientHeight
-  const vW = video.videoWidth
-  const vH = video.videoHeight
-  if (vW === 0 || vH === 0 || cW === 0 || cH === 0) return { sx: 0, sy: 0, sw: vW, sh: vH }
-
-  const cAspect = cW / cH
-  const vAspect = vW / vH
-
-  let renderW: number, renderH: number, offX: number, offY: number
-  if (vAspect > cAspect) {
-    renderH = cH; renderW = cH * vAspect
-    offX = (renderW - cW) / 2; offY = 0
-  } else {
-    renderW = cW; renderH = cW / vAspect
-    offX = 0; offY = (renderH - cH) / 2
-  }
-  const scale = vW / renderW
-
-  const fW = cW * 0.80
-  const fH = fW * (297 / 210)
-  const fX = (cW - fW) / 2
-  const fY = (cH - fH) / 2
-
-  let sx = (fX + offX) * scale
-  let sy = (fY + offY) * scale
-  let sw = fW * scale
-  let sh = fH * scale
-
-  sx = Math.max(0, Math.min(vW, sx))
-  sy = Math.max(0, Math.min(vH, sy))
-  sw = Math.min(sw, vW - sx)
-  sh = Math.min(sh, vH - sy)
-
-  return { sx: Math.round(sx), sy: Math.round(sy), sw: Math.round(sw), sh: Math.round(sh) }
-}
 
 function processDocumentScan(source: HTMLCanvasElement, filter: Filter, adj: Adjustments): HTMLCanvasElement {
   const w = source.width, h = source.height
@@ -84,46 +46,106 @@ function processDocumentScan(source: HTMLCanvasElement, filter: Filter, adj: Adj
 
   const imageData = ctx.getImageData(0, 0, w, h)
   const d = imageData.data
+  const totalPixels = w * h
 
-  // Auto-levels
-  const step = Math.max(1, Math.floor(d.length / 4 / 5000)) * 4
-  const samples: number[] = []
-  for (let i = 0; i < d.length; i += step) {
-    samples.push(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2])
-  }
-  samples.sort((a, b) => a - b)
-  const pLow = samples[Math.floor(samples.length * 0.03)] ?? 0
-  const pHigh = samples[Math.floor(samples.length * 0.97)] ?? 255
-  const range = Math.max(1, pHigh - pLow)
+  if (filter === 'magicColor') {
+    // Per-channel 2nd-98th percentile stretching (CamScanner Magic Color)
+    const step = Math.max(1, Math.floor(totalPixels / 10000))
 
-  const doAutoLevels = filter !== 'original'
-  const brightnessOff = adj.brightness * 0.4
-  const contrastPow = 1 + adj.contrast / 100
-  const gamma = filter === 'original' ? 1.0 : 0.78
-
-  for (let i = 0; i < d.length; i += 4) {
-    for (let c = 0; c < 3; c++) {
-      let v = d[i + c]
-      if (doAutoLevels) v = ((v - pLow) / range) * 255
-      v += brightnessOff
-      v = Math.max(0, Math.min(1, v / 255))
-      if (gamma !== 1) v = Math.pow(v, gamma)
-      if (contrastPow !== 1) {
-        v = v < 0.5
-          ? 0.5 * Math.pow(2 * v, contrastPow)
-          : 1 - 0.5 * Math.pow(2 * (1 - v), contrastPow)
+    for (let ch = 0; ch < 3; ch++) {
+      const samples: number[] = []
+      for (let i = 0; i < totalPixels; i += step) {
+        samples.push(d[i * 4 + ch])
       }
-      d[i + c] = Math.round(v * 255)
+      samples.sort((a, b) => a - b)
+
+      const pLow = samples[Math.floor(samples.length * 0.02)] ?? 0
+      const pHigh = samples[Math.floor(samples.length * 0.98)] ?? 255
+      const range = Math.max(1, pHigh - pLow)
+
+      for (let i = 0; i < totalPixels; i++) {
+        let v = d[i * 4 + ch]
+        v = ((v - pLow) / range) * 255
+        v += adj.brightness * 0.3
+        v = Math.max(0, Math.min(255, v))
+        if (adj.contrast !== 0) {
+          const norm = v / 255
+          const pow = 1 + adj.contrast / 100
+          const cv = norm < 0.5
+            ? 0.5 * Math.pow(2 * norm, pow)
+            : 1 - 0.5 * Math.pow(2 * (1 - norm), pow)
+          v = cv * 255
+        }
+        d[i * 4 + ch] = Math.round(Math.max(0, Math.min(255, v)))
+      }
+    }
+  } else if (filter === 'original') {
+    const brightnessOff = adj.brightness * 0.4
+    const contrastPow = 1 + adj.contrast / 100
+    for (let i = 0; i < d.length; i += 4) {
+      for (let c = 0; c < 3; c++) {
+        let v = d[i + c] + brightnessOff
+        v = Math.max(0, Math.min(1, v / 255))
+        if (contrastPow !== 1) {
+          v = v < 0.5
+            ? 0.5 * Math.pow(2 * v, contrastPow)
+            : 1 - 0.5 * Math.pow(2 * (1 - v), contrastPow)
+        }
+        d[i + c] = Math.round(v * 255)
+      }
+    }
+  } else if (filter === 'grayscale') {
+    const step = Math.max(1, Math.floor(totalPixels / 5000)) * 4
+    const samples: number[] = []
+    for (let i = 0; i < d.length; i += step) {
+      samples.push(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2])
+    }
+    samples.sort((a, b) => a - b)
+    const pLow = samples[Math.floor(samples.length * 0.03)] ?? 0
+    const pHigh = samples[Math.floor(samples.length * 0.97)] ?? 255
+    const range = Math.max(1, pHigh - pLow)
+
+    for (let i = 0; i < d.length; i += 4) {
+      let gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]
+      gray = ((gray - pLow) / range) * 255 + adj.brightness * 0.4
+      gray = Math.max(0, Math.min(255, gray))
+      d[i] = d[i + 1] = d[i + 2] = Math.round(gray)
+    }
+  } else if (filter === 'bw') {
+    // Otsu adaptive thresholding
+    const histogram = new Array(256).fill(0)
+    for (let i = 0; i < d.length; i += 4) {
+      const gray = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2])
+      histogram[gray]++
     }
 
-    if (filter === 'grayscale' || filter === 'highContrast') {
-      const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]
-      if (filter === 'highContrast') {
-        const val = gray > 135 ? 255 : 0
-        d[i] = d[i + 1] = d[i + 2] = val
-      } else {
-        d[i] = d[i + 1] = d[i + 2] = Math.round(gray)
+    let sumAll = 0
+    for (let t = 0; t < 256; t++) sumAll += t * histogram[t]
+
+    let sumB = 0, wB = 0, maxVariance = 0, bestThreshold = 128
+
+    for (let t = 0; t < 256; t++) {
+      wB += histogram[t]
+      if (wB === 0) continue
+      const wF = totalPixels - wB
+      if (wF === 0) break
+
+      sumB += t * histogram[t]
+      const meanB = sumB / wB
+      const meanF = (sumAll - sumB) / wF
+      const variance = wB * wF * (meanB - meanF) * (meanB - meanF)
+
+      if (variance > maxVariance) {
+        maxVariance = variance
+        bestThreshold = t
       }
+    }
+
+    const threshAdj = bestThreshold - adj.brightness * 0.5
+    for (let i = 0; i < d.length; i += 4) {
+      const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]
+      const val = gray > threshAdj ? 255 : 0
+      d[i] = d[i + 1] = d[i + 2] = val
     }
   }
 
@@ -156,7 +178,6 @@ function sharpenCanvas(canvas: HTMLCanvasElement, amount: number) {
   ctx.putImageData(original, 0, 0)
 }
 
-/** Process a raw canvas and return a File + thumbnail URL (async, used by edit/import) */
 function processAndCreateFile(raw: HTMLCanvasElement, filter: Filter, adj: Adjustments): Promise<{ file: File; url: string }> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('Processing timeout')), 5000)
@@ -175,7 +196,6 @@ function processAndCreateFile(raw: HTMLCanvasElement, filter: Filter, adj: Adjus
   })
 }
 
-/** Convert a canvas to a File synchronously via toDataURL (works on ALL browsers) */
 function canvasToFileSync(canvas: HTMLCanvasElement, quality = 0.92): { file: File; thumbnailUrl: string } {
   const dataUrl = canvas.toDataURL('image/jpeg', quality)
   const parts = dataUrl.split(',')
@@ -222,6 +242,7 @@ export default function Scanner() {
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const videoContainerRef = useRef<HTMLDivElement>(null)
+  const overlayCanvasRef = useRef<HTMLCanvasElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const importRef = useRef<HTMLInputElement | null>(null)
   const autoOpenDone = useRef(false)
@@ -234,15 +255,19 @@ export default function Scanner() {
   const [cameraSuccess, setCameraSuccess] = useState<string | null>(null)
   const [showFlash, setShowFlash] = useState(false)
 
+  // Crop phase state
+  const [cropCanvas, setCropCanvas] = useState<HTMLCanvasElement | null>(null)
+  const [cropCorners, setCropCorners] = useState<QuadCorners | null>(null)
+  const [draggingCorner, setDraggingCorner] = useState<string | null>(null)
+
   // Per-page editing state
   const [editingPageId, setEditingPageId] = useState<string | null>(null)
   const [editFilter, setEditFilter] = useState<Filter>(DEFAULT_FILTER)
   const [editAdj, setEditAdj] = useState<Adjustments>(DEFAULT_ADJ)
   const [editPreviewUrl, setEditPreviewUrl] = useState('')
 
-  // OpenCV runs in a Web Worker — loads in background, never blocks the UI
-  const { cvReady, detectAndCrop } = useDocumentDetection({
-    enabled: phase === 'camera',
+  const { cvReady, liveQuad, cropCanvasWithCorners, startLiveDetection, stopLiveDetection } = useDocumentDetection({
+    enabled: phase === 'camera' || phase === 'crop',
   })
 
   // Cleanup on unmount
@@ -255,10 +280,72 @@ export default function Scanner() {
     streamRef.current = null
   }, [])
 
+  // Start/stop live detection
+  useEffect(() => {
+    if (phase === 'camera' && cvReady) {
+      startLiveDetection(videoRef)
+    } else {
+      stopLiveDetection()
+    }
+  }, [phase, cvReady, startLiveDetection, stopLiveDetection])
+
+  // Draw overlay on live video showing detected quad
+  useEffect(() => {
+    if (phase !== 'camera') return
+
+    const overlayCanvas = overlayCanvasRef.current
+    const container = videoContainerRef.current
+    if (!overlayCanvas || !container) return
+
+    const cW = container.clientWidth
+    const cH = container.clientHeight
+    overlayCanvas.width = cW
+    overlayCanvas.height = cH
+
+    const ctx = overlayCanvas.getContext('2d')!
+    ctx.clearRect(0, 0, cW, cH)
+
+    if (!liveQuad) return
+
+    const pts = [
+      { x: liveQuad.topLeft.x * cW, y: liveQuad.topLeft.y * cH },
+      { x: liveQuad.topRight.x * cW, y: liveQuad.topRight.y * cH },
+      { x: liveQuad.bottomRight.x * cW, y: liveQuad.bottomRight.y * cH },
+      { x: liveQuad.bottomLeft.x * cW, y: liveQuad.bottomLeft.y * cH },
+    ]
+
+    // Semi-transparent fill
+    ctx.fillStyle = 'rgba(45, 185, 173, 0.15)'
+    ctx.beginPath()
+    ctx.moveTo(pts[0].x, pts[0].y)
+    pts.forEach(p => ctx.lineTo(p.x, p.y))
+    ctx.closePath()
+    ctx.fill()
+
+    // Border
+    ctx.strokeStyle = '#2db9ad'
+    ctx.lineWidth = 3
+    ctx.beginPath()
+    ctx.moveTo(pts[0].x, pts[0].y)
+    pts.forEach(p => ctx.lineTo(p.x, p.y))
+    ctx.closePath()
+    ctx.stroke()
+
+    // Corner circles
+    ctx.fillStyle = '#2db9ad'
+    pts.forEach(p => {
+      ctx.beginPath()
+      ctx.arc(p.x, p.y, 8, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.strokeStyle = '#fff'
+      ctx.lineWidth = 2
+      ctx.stroke()
+    })
+  }, [phase, liveQuad])
+
   // Editing page reference
   const editingPage = pages.find((p) => p.id === editingPageId) ?? null
 
-  // Preview canvas for edit mode (smaller for performance)
   const editPreviewCanvas = useMemo(() => {
     if (!editingPage) return null
     const raw = editingPage.rawCanvas
@@ -272,7 +359,6 @@ export default function Scanner() {
     return c
   }, [editingPage])
 
-  // Live preview when editing filter/sliders change
   useEffect(() => {
     if (phase !== 'editPage' || !editPreviewCanvas) return
     const processed = processDocumentScan(editPreviewCanvas, editFilter, editAdj)
@@ -283,7 +369,6 @@ export default function Scanner() {
   const openCamera = useCallback(async () => {
     setCameraError(null)
 
-    // Clean up any existing stream first
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((tr) => tr.stop())
       streamRef.current = null
@@ -297,11 +382,8 @@ export default function Scanner() {
         video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
       })
       streamRef.current = stream
-
-      // Set phase first to trigger render of <video> element
       setPhase('camera')
 
-      // Wait for React to mount the video element, then attach stream
       const attachStream = async (retries = 20): Promise<void> => {
         const video = videoRef.current
         if (!video) {
@@ -313,9 +395,7 @@ export default function Scanner() {
         }
 
         video.srcObject = stream
-
-        // Wait for metadata to load
-        const v = video // capture non-null reference
+        const v = video
         await new Promise<void>((resolve, reject) => {
           if (v.readyState >= 1) { resolve(); return }
           const onLoaded = () => { cleanup(); resolve() }
@@ -335,7 +415,6 @@ export default function Scanner() {
 
       await attachStream()
     } catch {
-      // If stream was acquired but video failed, clean up
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((tr) => tr.stop())
         streamRef.current = null
@@ -345,7 +424,6 @@ export default function Scanner() {
     }
   }, [t])
 
-  // Auto-open camera if ?mode=camera (placed AFTER openCamera definition)
   useEffect(() => {
     if (!autoOpenDone.current && searchParams.get('mode') === 'camera' && phase === 'home') {
       autoOpenDone.current = true
@@ -354,6 +432,7 @@ export default function Scanner() {
   }, [searchParams, phase, openCamera])
 
   function stopCamera() {
+    stopLiveDetection()
     if (videoRef.current) {
       videoRef.current.pause()
       videoRef.current.srcObject = null
@@ -362,91 +441,153 @@ export default function Scanner() {
     streamRef.current = null
   }
 
-  // ---- Capture: flash is sync, detection runs in Web Worker ----
+  // ---- Capture ----
   async function capturePhoto() {
-    // Flash FIRST — user sees feedback immediately
     setShowFlash(true)
     setTimeout(() => setShowFlash(false), 200)
 
     const video = videoRef.current
-    const container = videoContainerRef.current
-    if (!video || !container) {
+    if (!video) {
       setCameraError('Camera not ready')
       setTimeout(() => setCameraError(null), 3000)
       return
     }
 
     try {
-      // Try auto-detect via Web Worker (runs in background thread, non-blocking)
-      let rawCanvas: HTMLCanvasElement
-      let detected = false
+      const vw = video.videoWidth
+      const vh = video.videoHeight
+      if (vw === 0 || vh === 0) return
 
-      if (cvReady) {
-        const result = await detectAndCrop(video)
-        console.log('[ScanFlow] detection:', result.debug)
-        if (result.canvas) {
-          rawCanvas = result.canvas
-          detected = true
-        } else {
-          rawCanvas = cropFrame(video, container)
+      // Capture full-res frame
+      const fullCanvas = document.createElement('canvas')
+      fullCanvas.width = vw
+      fullCanvas.height = vh
+      fullCanvas.getContext('2d')!.drawImage(video, 0, 0)
+
+      if (liveQuad) {
+        // Auto-crop using the detected quad
+        stopLiveDetection()
+        const pixelCorners: QuadCorners = {
+          topLeft: { x: liveQuad.topLeft.x * vw, y: liveQuad.topLeft.y * vh },
+          topRight: { x: liveQuad.topRight.x * vw, y: liveQuad.topRight.y * vh },
+          bottomRight: { x: liveQuad.bottomRight.x * vw, y: liveQuad.bottomRight.y * vh },
+          bottomLeft: { x: liveQuad.bottomLeft.x * vw, y: liveQuad.bottomLeft.y * vh },
         }
-      } else {
-        rawCanvas = cropFrame(video, container)
-      }
 
-      // Show green success message when auto-detect worked
-      if (detected) {
+        const result = await cropCanvasWithCorners(fullCanvas, pixelCorners)
+        const rawCanvas = result.canvas ?? fullCanvas
+
+        const processed = processDocumentScan(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
+        const { file, thumbnailUrl } = canvasToFileSync(processed)
+        const id = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+
+        setPages((prev) => [...prev, { id, rawCanvas, filter: DEFAULT_FILTER, adjustments: { ...DEFAULT_ADJ }, processedFile: file, thumbnailUrl }])
+
         setCameraSuccess(t('scanner.documentDetected'))
         setTimeout(() => setCameraSuccess(null), 2000)
+
+        // Restart live detection for next page
+        startLiveDetection(videoRef)
+      } else {
+        // No quad detected — go to manual crop
+        stopCamera()
+        setCropCanvas(fullCanvas)
+        setCropCorners({
+          topLeft: { x: 0.1, y: 0.1 },
+          topRight: { x: 0.9, y: 0.1 },
+          bottomRight: { x: 0.9, y: 0.9 },
+          bottomLeft: { x: 0.1, y: 0.9 },
+        })
+        setPhase('crop')
       }
-
-      const processed = processDocumentScan(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
-      const { file, thumbnailUrl } = canvasToFileSync(processed)
-
-      const id = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
-
-      setPages((prev) => [...prev, {
-        id,
-        rawCanvas,
-        filter: DEFAULT_FILTER,
-        adjustments: { ...DEFAULT_ADJ },
-        processedFile: file,
-        thumbnailUrl,
-      }])
     } catch (err) {
       setCameraError(err instanceof Error ? err.message : t('scanner.cameraError'))
       setTimeout(() => setCameraError(null), 5000)
     }
   }
 
-  /** Crop video to the A4 frame area, with fallback for 0-dimension edge cases */
-  function cropFrame(video: HTMLVideoElement, container: HTMLElement): HTMLCanvasElement {
-    const vw = video.videoWidth
-    const vh = video.videoHeight
-
-    if (vw > 0 && vh > 0) {
-      const { sx, sy, sw, sh } = getFrameCropRect(video, container)
-      const w = Math.max(1, sw)
-      const h = Math.max(1, sh)
-      const canvas = document.createElement('canvas')
-      canvas.width = w; canvas.height = h
-      canvas.getContext('2d')!.drawImage(video, sx, sy, sw, sh, 0, 0, w, h)
-      return canvas
-    }
-
-    // Fallback: video dimensions unavailable, capture at display size
-    const w = container.clientWidth || 1080
-    const h = container.clientHeight || 1920
-    const canvas = document.createElement('canvas')
-    canvas.width = w; canvas.height = h
-    canvas.getContext('2d')!.drawImage(video, 0, 0, w, h)
-    return canvas
-  }
-
   function handleCameraDone() {
     stopCamera()
     if (pages.length > 0) setPhase('review')
     else setPhase('home')
+  }
+
+  // ---- Manual crop handlers ----
+  function handleCropConfirm() {
+    if (!cropCanvas || !cropCorners) return
+
+    const w = cropCanvas.width
+    const h = cropCanvas.height
+    const pixelCorners: QuadCorners = {
+      topLeft: { x: cropCorners.topLeft.x * w, y: cropCorners.topLeft.y * h },
+      topRight: { x: cropCorners.topRight.x * w, y: cropCorners.topRight.y * h },
+      bottomRight: { x: cropCorners.bottomRight.x * w, y: cropCorners.bottomRight.y * h },
+      bottomLeft: { x: cropCorners.bottomLeft.x * w, y: cropCorners.bottomLeft.y * h },
+    }
+
+    cropCanvasWithCorners(cropCanvas, pixelCorners).then((result) => {
+      const rawCanvas = result.canvas ?? cropCanvas
+      const processed = processDocumentScan(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
+      const { file, thumbnailUrl } = canvasToFileSync(processed)
+      const id = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+
+      setPages((prev) => [...prev, { id, rawCanvas, filter: DEFAULT_FILTER, adjustments: { ...DEFAULT_ADJ }, processedFile: file, thumbnailUrl }])
+      setCropCanvas(null)
+      setCropCorners(null)
+      openCamera()
+    })
+  }
+
+  function handleCropCancel() {
+    setCropCanvas(null)
+    setCropCorners(null)
+    openCamera()
+  }
+
+  function getCropCornerAt(x: number, y: number, containerW: number, containerH: number): string | null {
+    if (!cropCorners) return null
+    const threshold = 0.06
+    const corners: [string, { x: number; y: number }][] = [
+      ['topLeft', cropCorners.topLeft],
+      ['topRight', cropCorners.topRight],
+      ['bottomRight', cropCorners.bottomRight],
+      ['bottomLeft', cropCorners.bottomLeft],
+    ]
+    const nx = x / containerW
+    const ny = y / containerH
+    let best: string | null = null
+    let bestDist = threshold
+    for (const [name, pt] of corners) {
+      const dist = Math.hypot(nx - pt.x, ny - pt.y)
+      if (dist < bestDist) {
+        bestDist = dist
+        best = name
+      }
+    }
+    return best
+  }
+
+  function handleCropPointerDown(e: React.PointerEvent) {
+    const rect = e.currentTarget.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    const corner = getCropCornerAt(x, y, rect.width, rect.height)
+    if (corner) {
+      setDraggingCorner(corner)
+      ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+    }
+  }
+
+  function handleCropPointerMove(e: React.PointerEvent) {
+    if (!draggingCorner || !cropCorners) return
+    const rect = e.currentTarget.getBoundingClientRect()
+    const nx = Math.max(0.02, Math.min(0.98, (e.clientX - rect.left) / rect.width))
+    const ny = Math.max(0.02, Math.min(0.98, (e.clientY - rect.top) / rect.height))
+    setCropCorners({ ...cropCorners, [draggingCorner]: { x: nx, y: ny } })
+  }
+
+  function handleCropPointerUp() {
+    setDraggingCorner(null)
   }
 
   // ---- Import ----
@@ -468,20 +609,12 @@ export default function Scanner() {
 
         const { file: pFile, url } = await processAndCreateFile(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
         const id = `import_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
-        setPages((prev) => [...prev, {
-          id,
-          rawCanvas,
-          filter: DEFAULT_FILTER,
-          adjustments: { ...DEFAULT_ADJ },
-          processedFile: pFile,
-          thumbnailUrl: url,
-        }])
+        setPages((prev) => [...prev, { id, rawCanvas, filter: DEFAULT_FILTER, adjustments: { ...DEFAULT_ADJ }, processedFile: pFile, thumbnailUrl: url }])
       }
       img.src = objUrl
     }
 
     if (phase === 'home') {
-      // Will transition to review once pages are added (via effect below)
       setTimeout(() => setPhase('review'), 300)
     }
   }
@@ -499,8 +632,6 @@ export default function Scanner() {
   async function savePageEdit() {
     if (!editingPage) return
     const { file, url } = await processAndCreateFile(editingPage.rawCanvas, editFilter, editAdj)
-
-    // Revoke old thumbnail
     URL.revokeObjectURL(editingPage.thumbnailUrl)
 
     setPages((prev) => prev.map((p) =>
@@ -517,7 +648,6 @@ export default function Scanner() {
     setPhase('review')
   }
 
-  // ---- Page management ----
   function removePage(id: string) {
     setPages((prev) => {
       const page = prev.find((p) => p.id === id)
@@ -538,17 +668,8 @@ export default function Scanner() {
       const blob = toBlob(bytes)
       setResultBlob(blob)
 
-      // Save to document store for persistence
       const fileName = `scan_${new Date().toISOString().slice(0, 10)}.pdf`
-      addDocument({
-        id: `doc_${Date.now()}`,
-        title: fileName,
-        type: 'scan',
-        size: blob.size,
-        createdAt: new Date().toISOString(),
-        blobUrl: URL.createObjectURL(blob),
-      })
-
+      addDocument({ id: `doc_${Date.now()}`, title: fileName, type: 'scan', size: blob.size, createdAt: new Date().toISOString(), blobUrl: URL.createObjectURL(blob) })
       setPhase('done')
     } catch (err) {
       setProcessError(err instanceof Error ? err.message : 'Processing failed')
@@ -560,30 +681,80 @@ export default function Scanner() {
     pages.forEach((p) => URL.revokeObjectURL(p.thumbnailUrl))
     setPhase('home'); setPages([]); setResultBlob(null)
     setProcessError(null); setEditingPageId(null)
+    setCropCanvas(null); setCropCorners(null)
   }
 
   // ==============================================================
-  // EDIT PAGE SCREEN (per-page adjustments from review)
+  // MANUAL CROP SCREEN
+  // ==============================================================
+  if (phase === 'crop' && cropCanvas && cropCorners) {
+    const dataUrl = cropCanvas.toDataURL('image/jpeg', 0.85)
+    const pts = [cropCorners.topLeft, cropCorners.topRight, cropCorners.bottomRight, cropCorners.bottomLeft]
+
+    return (
+      <div className="fixed inset-0 z-50 flex flex-col bg-gray-950">
+        <div className="flex items-center justify-between px-4 pb-2 pt-6">
+          <button onClick={handleCropCancel} className="flex items-center gap-1 rounded-lg px-3 py-2 text-sm font-medium text-white/80 active:text-white">
+            <span className="material-symbols-outlined text-lg">arrow_back</span>
+            {t('common.cancel')}
+          </button>
+          <span className="text-sm font-medium text-white/70">{t('scanner.manualCrop')}</span>
+          <button onClick={handleCropConfirm} className="rounded-lg bg-primary px-4 py-2 text-sm font-bold text-white active:bg-primary/80">
+            {t('scanner.confirmCrop')}
+          </button>
+        </div>
+
+        <div
+          className="relative flex-1 mx-4 my-2 touch-none"
+          onPointerDown={handleCropPointerDown}
+          onPointerMove={handleCropPointerMove}
+          onPointerUp={handleCropPointerUp}
+          onPointerCancel={handleCropPointerUp}
+        >
+          <img src={dataUrl} alt="" className="h-full w-full rounded-xl object-contain" />
+          <svg className="absolute inset-0 h-full w-full" viewBox="0 0 1 1" preserveAspectRatio="none">
+            <defs>
+              <mask id="cropMask">
+                <rect x="0" y="0" width="1" height="1" fill="white" />
+                <polygon points={pts.map(p => `${p.x},${p.y}`).join(' ')} fill="black" />
+              </mask>
+            </defs>
+            <rect x="0" y="0" width="1" height="1" fill="rgba(0,0,0,0.5)" mask="url(#cropMask)" />
+            <polygon points={pts.map(p => `${p.x},${p.y}`).join(' ')} fill="rgba(45, 185, 173, 0.1)" stroke="#2db9ad" strokeWidth="0.004" />
+            {pts.map((p, i) => {
+              const next = pts[(i + 1) % 4]
+              return <line key={i} x1={p.x} y1={p.y} x2={next.x} y2={next.y} stroke="#2db9ad" strokeWidth="0.004" />
+            })}
+            {pts.map((p, i) => (
+              <circle key={i} cx={p.x} cy={p.y} r="0.025" fill="#2db9ad" stroke="#fff" strokeWidth="0.004" />
+            ))}
+          </svg>
+        </div>
+
+        <div className="px-5 pb-8 pt-3 text-center">
+          <p className="text-xs text-white/60">{t('scanner.dragCorners')}</p>
+        </div>
+      </div>
+    )
+  }
+
+  // ==============================================================
+  // EDIT PAGE SCREEN
   // ==============================================================
   if (phase === 'editPage' && editingPage) {
     const pageIndex = pages.findIndex((p) => p.id === editingPageId)
     return (
       <div className="fixed inset-0 z-50 flex flex-col bg-gray-950">
-        {/* Top bar */}
         <div className="flex items-center justify-between px-4 pb-2 pt-6">
           <button onClick={cancelPageEdit} className="flex items-center gap-1 rounded-lg px-3 py-2 text-sm font-medium text-white/80 active:text-white">
             <span className="material-symbols-outlined text-lg">arrow_back</span>
             {t('common.cancel')}
           </button>
-          <span className="rounded-full bg-white/10 px-3 py-1 text-xs font-bold text-white">
-            Page {pageIndex + 1}/{pages.length}
-          </span>
+          <span className="rounded-full bg-white/10 px-3 py-1 text-xs font-bold text-white">Page {pageIndex + 1}/{pages.length}</span>
           <button onClick={savePageEdit} className="rounded-lg bg-primary px-4 py-2 text-sm font-bold text-white active:bg-primary/80">
             {t('common.save')}
           </button>
         </div>
-
-        {/* Preview image */}
         <div className="flex flex-1 items-center justify-center px-4 py-2">
           {editPreviewUrl ? (
             <img src={editPreviewUrl} alt="" className="max-h-full max-w-full rounded-xl shadow-2xl" />
@@ -591,62 +762,47 @@ export default function Scanner() {
             <span className="material-symbols-outlined animate-spin text-3xl text-white/50">progress_activity</span>
           )}
         </div>
-
-        {/* Filter chips */}
         <div className="flex items-center justify-center gap-1.5 px-3 py-2">
-          {(['enhance', 'original', 'grayscale', 'highContrast'] as Filter[]).map((f) => (
-            <button
-              key={f}
-              onClick={() => setEditFilter(f)}
-              className={`rounded-full px-3.5 py-1.5 text-xs font-medium transition-all ${
-                editFilter === f ? 'scale-105 bg-primary text-white' : 'bg-white/15 text-white/80'
-              }`}
-            >
+          {(['magicColor', 'original', 'grayscale', 'bw'] as Filter[]).map((f) => (
+            <button key={f} onClick={() => setEditFilter(f)}
+              className={`rounded-full px-3.5 py-1.5 text-xs font-medium transition-all ${editFilter === f ? 'scale-105 bg-primary text-white' : 'bg-white/15 text-white/80'}`}>
               {t(`scanner.filter_${f}`)}
             </button>
           ))}
         </div>
-
-        {/* Adjustment sliders */}
         <div className="space-y-2 bg-gray-900/80 px-5 pb-8 pt-3">
-          <SliderRow icon="brightness_6" label={t('scanner.brightness')} value={editAdj.brightness} min={-60} max={60}
-            onChange={(v) => setEditAdj((a) => ({ ...a, brightness: v }))} />
-          <SliderRow icon="contrast" label={t('scanner.contrast')} value={editAdj.contrast} min={-30} max={100}
-            onChange={(v) => setEditAdj((a) => ({ ...a, contrast: v }))} />
-          <SliderRow icon="deblur" label={t('scanner.sharpness')} value={editAdj.sharpness} min={0} max={100}
-            onChange={(v) => setEditAdj((a) => ({ ...a, sharpness: v }))} />
+          <SliderRow icon="brightness_6" label={t('scanner.brightness')} value={editAdj.brightness} min={-60} max={60} onChange={(v) => setEditAdj((a) => ({ ...a, brightness: v }))} />
+          <SliderRow icon="contrast" label={t('scanner.contrast')} value={editAdj.contrast} min={-30} max={100} onChange={(v) => setEditAdj((a) => ({ ...a, contrast: v }))} />
+          <SliderRow icon="deblur" label={t('scanner.sharpness')} value={editAdj.sharpness} min={0} max={100} onChange={(v) => setEditAdj((a) => ({ ...a, sharpness: v }))} />
         </div>
       </div>
     )
   }
 
   // ==============================================================
-  // CAMERA SCREEN — continuous shooting, stay here
+  // CAMERA SCREEN
   // ==============================================================
   if (phase === 'camera') {
     return (
       <div className="fixed inset-0 z-50 flex flex-col bg-black">
         <div ref={videoContainerRef} className="relative flex-1 overflow-hidden">
           <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover" />
+          <canvas ref={overlayCanvasRef} className="pointer-events-none absolute inset-0 h-full w-full" />
 
-          {/* A4 guide frame */}
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-            <div
-              className="relative"
-              style={{ width: '80%', aspectRatio: '210 / 297', boxShadow: '0 0 0 9999px rgba(0,0,0,0.4)', borderRadius: '8px' }}
-            >
-              <div className="absolute inset-0 rounded-lg border border-white/50" />
-              <div className="absolute -left-px -top-px h-7 w-7 rounded-tl-lg border-l-[3px] border-t-[3px] border-primary" />
-              <div className="absolute -right-px -top-px h-7 w-7 rounded-tr-lg border-r-[3px] border-t-[3px] border-primary" />
-              <div className="absolute -bottom-px -left-px h-7 w-7 rounded-bl-lg border-b-[3px] border-l-[3px] border-primary" />
-              <div className="absolute -bottom-px -right-px h-7 w-7 rounded-br-lg border-b-[3px] border-r-[3px] border-primary" />
+          {!liveQuad && (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+              <div className="relative" style={{ width: '80%', aspectRatio: '210 / 297', boxShadow: '0 0 0 9999px rgba(0,0,0,0.4)', borderRadius: '8px' }}>
+                <div className="absolute inset-0 rounded-lg border border-white/50" />
+                <div className="absolute -left-px -top-px h-7 w-7 rounded-tl-lg border-l-[3px] border-t-[3px] border-primary" />
+                <div className="absolute -right-px -top-px h-7 w-7 rounded-tr-lg border-r-[3px] border-t-[3px] border-primary" />
+                <div className="absolute -bottom-px -left-px h-7 w-7 rounded-bl-lg border-b-[3px] border-l-[3px] border-primary" />
+                <div className="absolute -bottom-px -right-px h-7 w-7 rounded-br-lg border-b-[3px] border-r-[3px] border-primary" />
+              </div>
             </div>
-          </div>
+          )}
 
-          {/* Flash */}
           <div className={`pointer-events-none absolute inset-0 z-10 bg-white transition-opacity duration-200 ease-out ${showFlash ? 'opacity-70' : 'opacity-0'}`} />
 
-          {/* Page counter badge */}
           {pages.length > 0 && (
             <div className="absolute left-3 top-3 z-20 flex items-center gap-1.5 rounded-full bg-primary px-3 py-1.5 shadow-lg">
               <span className="material-symbols-outlined text-sm text-white">description</span>
@@ -654,14 +810,10 @@ export default function Scanner() {
             </div>
           )}
 
-          {/* Error message (shows briefly on capture failure) */}
           {cameraError && (
-            <div className="absolute left-3 right-3 top-14 z-30 rounded-lg bg-red-600/90 px-4 py-2.5 text-center text-sm font-medium text-white shadow-lg">
-              {cameraError}
-            </div>
+            <div className="absolute left-3 right-3 top-14 z-30 rounded-lg bg-red-600/90 px-4 py-2.5 text-center text-sm font-medium text-white shadow-lg">{cameraError}</div>
           )}
 
-          {/* Success message (shows briefly when document auto-detected) */}
           {cameraSuccess && (
             <div className="absolute left-3 right-3 top-14 z-30 flex items-center justify-center gap-2 rounded-lg bg-green-600/90 px-4 py-2.5 text-center text-sm font-medium text-white shadow-lg">
               <span className="material-symbols-outlined text-base">check_circle</span>
@@ -669,15 +821,13 @@ export default function Scanner() {
             </div>
           )}
 
-          {/* Guide text */}
           <div className="absolute bottom-3 left-0 right-0 z-20 text-center">
-            <span className="rounded-full bg-black/50 px-4 py-1.5 text-xs font-medium text-white/90">
-              {cvReady ? t('scanner.autoDetectReady') : t('scanner.alignDocument')}
+            <span className={`rounded-full px-4 py-1.5 text-xs font-medium ${liveQuad ? 'bg-green-600/80 text-white' : 'bg-black/50 text-white/90'}`}>
+              {liveQuad ? t('scanner.documentDetected') : cvReady ? t('scanner.autoDetectReady') : t('scanner.alignDocument')}
             </span>
           </div>
         </div>
 
-        {/* Thumbnail strip — shows captured pages */}
         {pages.length > 0 && (
           <div className="flex items-center gap-2 overflow-x-auto bg-black/90 px-3 py-2">
             {pages.map((page, i) => (
@@ -689,16 +839,13 @@ export default function Scanner() {
           </div>
         )}
 
-        {/* Bottom controls */}
         <div className="flex items-center justify-between bg-black px-5 pb-8 pt-4">
           <button onClick={() => { stopCamera(); setPhase(pages.length > 0 ? 'review' : 'home') }} className="min-w-[64px] rounded-lg px-2 py-2 text-sm font-medium text-white/80">
             {t('common.cancel')}
           </button>
-          <button
-            onClick={capturePhoto}
-            className="flex h-[72px] w-[72px] items-center justify-center rounded-full border-[4px] border-white shadow-lg transition-transform active:scale-90"
-          >
-            <div className="pointer-events-none h-[56px] w-[56px] rounded-full bg-white" />
+          <button onClick={capturePhoto}
+            className={`flex h-[72px] w-[72px] items-center justify-center rounded-full border-[4px] shadow-lg transition-transform active:scale-90 ${liveQuad ? 'border-green-400' : 'border-white'}`}>
+            <div className={`pointer-events-none h-[56px] w-[56px] rounded-full ${liveQuad ? 'bg-green-400' : 'bg-white'}`} />
           </button>
           {pages.length > 0 ? (
             <button onClick={handleCameraDone} className="min-w-[64px] rounded-lg bg-primary/20 px-3 py-2 text-sm font-bold text-primary active:bg-primary/30">
@@ -746,17 +893,13 @@ export default function Scanner() {
             <p className="mb-2 text-center text-xs font-medium text-text-secondary">{t('scanner.editBeforeSaving')}</p>
             <div className="flex gap-2">
               <button onClick={() => {
-                if (resultBlob) {
-                  setPendingFile(new File([resultBlob], `scan_${new Date().toISOString().slice(0, 10)}.pdf`, { type: 'application/pdf' }))
-                }
+                if (resultBlob) setPendingFile(new File([resultBlob], `scan_${new Date().toISOString().slice(0, 10)}.pdf`, { type: 'application/pdf' }))
                 navigate('/tools/edit')
               }} className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-gray-200 bg-white py-2.5 text-xs font-medium text-text-primary shadow-sm hover:bg-gray-50 dark:border-slate-700 dark:bg-[#1a2b2a]">
                 <span className="material-symbols-outlined text-base text-blue-500">edit</span>{t('tools.editPdf')}
               </button>
               <button onClick={() => {
-                if (resultBlob) {
-                  setPendingFile(new File([resultBlob], `scan_${new Date().toISOString().slice(0, 10)}.pdf`, { type: 'application/pdf' }))
-                }
+                if (resultBlob) setPendingFile(new File([resultBlob], `scan_${new Date().toISOString().slice(0, 10)}.pdf`, { type: 'application/pdf' }))
                 navigate('/tools/sign')
               }} className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-gray-200 bg-white py-2.5 text-xs font-medium text-text-primary shadow-sm hover:bg-gray-50 dark:border-slate-700 dark:bg-[#1a2b2a]">
                 <span className="material-symbols-outlined text-base text-green-600">draw</span>{t('tools.sign')}
@@ -770,7 +913,7 @@ export default function Scanner() {
   }
 
   // ==============================================================
-  // REVIEW SCREEN — all pages, tap to edit, reorder
+  // REVIEW SCREEN
   // ==============================================================
   if (phase === 'review') {
     return (
@@ -790,20 +933,15 @@ export default function Scanner() {
         <div className="flex-1 px-4 pb-24">
           <div className="mt-3 grid grid-cols-3 gap-2.5">
             {pages.map((page, i) => (
-              <div
-                key={page.id}
-                className="group relative cursor-pointer overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm transition-transform active:scale-95 dark:border-slate-700 dark:bg-[#1a2b2a]"
-                onClick={() => openPageEditor(page.id)}
-              >
+              <div key={page.id} className="group relative cursor-pointer overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm transition-transform active:scale-95 dark:border-slate-700 dark:bg-[#1a2b2a]"
+                onClick={() => openPageEditor(page.id)}>
                 <img src={page.thumbnailUrl} alt={`Page ${i + 1}`} className="aspect-[3/4] w-full object-cover" />
                 <div className="absolute bottom-0 left-0 right-0 flex items-end justify-between bg-gradient-to-t from-black/60 px-2 pb-1.5 pt-4">
                   <span className="text-[11px] font-bold text-white">{i + 1}</span>
                   <span className="material-symbols-outlined text-sm text-white/80">tune</span>
                 </div>
-                <button
-                  onClick={(e) => { e.stopPropagation(); removePage(page.id) }}
-                  className="absolute right-1.5 top-1.5 flex h-6 w-6 items-center justify-center rounded-full bg-black/50 text-white opacity-0 transition-opacity group-hover:opacity-100"
-                >
+                <button onClick={(e) => { e.stopPropagation(); removePage(page.id) }}
+                  className="absolute right-1.5 top-1.5 flex h-6 w-6 items-center justify-center rounded-full bg-black/50 text-white opacity-0 transition-opacity group-hover:opacity-100">
                   <span className="material-symbols-outlined text-sm">close</span>
                 </button>
               </div>

@@ -180,10 +180,10 @@
     "creatingPdf": "Creating PDF...",
     "done": "Done",
     "cameraError": "Unable to access camera. Please check permissions.",
+    "filter_magicColor": "Magic Color",
     "filter_original": "Original",
-    "filter_enhance": "Enhance",
     "filter_grayscale": "Gray",
-    "filter_highContrast": "Contrast",
+    "filter_bw": "B&W",
     "alignDocument": "Align the document within the frame",
     "documentDetected": "Document detected",
     "autoDetectReady": "Auto-crop enabled",
@@ -198,7 +198,10 @@
     "contrast": "Contrast",
     "sharpness": "Sharpness",
     "tipTitle": "Tip",
-    "tipText": "Place your document on a contrasting background and ensure good lighting for best results."
+    "tipText": "Place your document on a contrasting background and ensure good lighting for best results.",
+    "manualCrop": "Adjust crop",
+    "confirmCrop": "Confirm",
+    "dragCorners": "Drag the corners to adjust the document crop"
   },
   "toolPage": {
     "description": "Select your files to start processing.",
