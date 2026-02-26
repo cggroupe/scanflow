@@ -845,21 +845,18 @@ export default function Scanner() {
             <span className="material-symbols-outlined animate-spin text-3xl text-white/50">progress_activity</span>
           )}
         </div>
-        <div className="flex items-center justify-center gap-1.5 px-3 py-1">
+        <div className="flex items-center justify-center gap-1 px-2 py-1">
           {(['magicColor', 'original', 'grayscale', 'bw'] as Filter[]).map((f) => (
             <button key={f} onClick={() => setEditFilter(f)}
-              className={`rounded-full px-3.5 py-1.5 text-xs font-medium transition-all ${editFilter === f ? 'scale-105 bg-primary text-white' : 'bg-white/15 text-white/80'}`}>
+              className={`rounded-full px-3 py-1.5 text-[11px] font-medium transition-all ${editFilter === f ? 'scale-105 bg-primary text-white' : 'bg-white/15 text-white/80'}`}>
               {t(`scanner.filter_${f}`)}
             </button>
           ))}
-        </div>
-        <div className="flex items-center justify-center px-3 py-1">
-          <button onClick={handleRecrop} className="flex items-center gap-1.5 rounded-full bg-white/10 px-4 py-1.5 text-xs font-medium text-white/80 active:bg-white/20">
+          <button onClick={handleRecrop} className="ml-1 flex items-center gap-1 rounded-full bg-white/10 px-2.5 py-1.5 text-[11px] font-medium text-white/80 active:bg-white/20">
             <span className="material-symbols-outlined text-sm">crop</span>
-            {t('scanner.manualCrop')}
           </button>
         </div>
-        <div className="space-y-2 bg-gray-900/80 px-5 pt-2" style={{ paddingBottom: 'calc(1.5rem + env(safe-area-inset-bottom, 0px))' }}>
+        <div className="space-y-1.5 bg-gray-900/80 px-5 pt-1.5" style={{ paddingBottom: 'calc(1rem + env(safe-area-inset-bottom, 0px))' }}>
           <SliderRow icon="brightness_6" label={t('scanner.brightness')} value={editAdj.brightness} min={-60} max={60} onChange={(v) => setEditAdj((a) => ({ ...a, brightness: v }))} />
           <SliderRow icon="contrast" label={t('scanner.contrast')} value={editAdj.contrast} min={-30} max={100} onChange={(v) => setEditAdj((a) => ({ ...a, contrast: v }))} />
           <SliderRow icon="deblur" label={t('scanner.sharpness')} value={editAdj.sharpness} min={0} max={100} onChange={(v) => setEditAdj((a) => ({ ...a, sharpness: v }))} />
