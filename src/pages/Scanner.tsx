@@ -28,7 +28,7 @@ interface ScannedPage {
   thumbnailUrl: string
 }
 
-const DEFAULT_ADJ: Adjustments = { brightness: 5, contrast: 20, sharpness: 40 }
+const DEFAULT_ADJ: Adjustments = { brightness: 0, contrast: 0, sharpness: 50 }
 const DEFAULT_FILTER: Filter = 'magicColor'
 
 // ================================================================
@@ -49,35 +49,69 @@ function processDocumentScan(source: HTMLCanvasElement, filter: Filter, adj: Adj
   const totalPixels = w * h
 
   if (filter === 'magicColor') {
-    // Per-channel 2nd-98th percentile stretching (CamScanner Magic Color)
-    const step = Math.max(1, Math.floor(totalPixels / 10000))
+    // ─── Photocopy Effect (v2) ───
+    // Full histogram per channel for accurate percentile calculation
+    const histR = new Uint32Array(256)
+    const histG = new Uint32Array(256)
+    const histB = new Uint32Array(256)
 
+    for (let i = 0; i < totalPixels; i++) {
+      const idx = i * 4
+      histR[d[idx]]++
+      histG[d[idx + 1]]++
+      histB[d[idx + 2]]++
+    }
+
+    function histPercentile(hist: Uint32Array, p: number): number {
+      const target = Math.floor(totalPixels * p)
+      let sum = 0
+      for (let i = 0; i < 256; i++) {
+        sum += hist[i]
+        if (sum >= target) return i
+      }
+      return 255
+    }
+
+    // Aggressive clipping: 0.5% – 99.5% (removes shadows & blown highlights)
+    const lows  = [histPercentile(histR, 0.005), histPercentile(histG, 0.005), histPercentile(histB, 0.005)]
+    const highs = [histPercentile(histR, 0.995), histPercentile(histG, 0.995), histPercentile(histB, 0.995)]
+
+    // Gamma < 1.0 brightens midtones → paper becomes white
+    const gamma = 0.65
+    const brightOff = adj.brightness / 200
+    const contPow = adj.contrast !== 0 ? 1 + adj.contrast / 50 : 1
+
+    // Build LUT per channel (256 entries) — O(1) per-pixel application
+    const luts: Uint8Array[] = []
     for (let ch = 0; ch < 3; ch++) {
-      const samples: number[] = []
-      for (let i = 0; i < totalPixels; i += step) {
-        samples.push(d[i * 4 + ch])
-      }
-      samples.sort((a, b) => a - b)
-
-      const pLow = samples[Math.floor(samples.length * 0.02)] ?? 0
-      const pHigh = samples[Math.floor(samples.length * 0.98)] ?? 255
-      const range = Math.max(1, pHigh - pLow)
-
-      for (let i = 0; i < totalPixels; i++) {
-        let v = d[i * 4 + ch]
-        v = ((v - pLow) / range) * 255
-        v += adj.brightness * 0.3
-        v = Math.max(0, Math.min(255, v))
-        if (adj.contrast !== 0) {
-          const norm = v / 255
-          const pow = 1 + adj.contrast / 100
-          const cv = norm < 0.5
-            ? 0.5 * Math.pow(2 * norm, pow)
-            : 1 - 0.5 * Math.pow(2 * (1 - norm), pow)
-          v = cv * 255
+      const lut = new Uint8Array(256)
+      const lo = lows[ch]
+      const range = Math.max(1, highs[ch] - lo)
+      for (let v = 0; v < 256; v++) {
+        // Percentile stretching
+        let n = Math.max(0, Math.min(1, (v - lo) / range))
+        // Gamma correction (paper → white)
+        n = Math.pow(n, gamma)
+        // User brightness offset
+        n += brightOff
+        n = Math.max(0, Math.min(1, n))
+        // User contrast (S-curve)
+        if (contPow !== 1) {
+          n = n < 0.5
+            ? 0.5 * Math.pow(2 * n, contPow)
+            : 1 - 0.5 * Math.pow(2 * (1 - n), contPow)
         }
-        d[i * 4 + ch] = Math.round(Math.max(0, Math.min(255, v)))
+        lut[v] = Math.round(Math.max(0, Math.min(1, n)) * 255)
       }
+      luts.push(lut)
+    }
+
+    // Apply LUTs in a single pass
+    for (let i = 0; i < totalPixels; i++) {
+      const idx = i * 4
+      d[idx]     = luts[0][d[idx]]
+      d[idx + 1] = luts[1][d[idx + 1]]
+      d[idx + 2] = luts[2][d[idx + 2]]
     }
   } else if (filter === 'original') {
     const brightnessOff = adj.brightness * 0.4

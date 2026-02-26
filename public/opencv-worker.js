@@ -169,7 +169,7 @@ function findDocumentCorners(src, width, height) {
     cv.cvtColor(small, gray, cv.COLOR_RGBA2GRAY);
     cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
 
-    var minArea = sw * sh * 0.04;
+    var minArea = sw * sh * 0.02;
     var imgCx = sw / 2;
     var imgCy = sh / 2;
     var imgArea = sw * sh;
@@ -247,6 +247,32 @@ function findDocumentCorners(src, width, height) {
       heavyBlur.delete();
     }
 
+    // ---- Strategy 5: Histogram equalization + Canny (uneven lighting) ----
+    var eqHist = new cv.Mat();
+    try {
+      cv.equalizeHist(gray, eqHist);
+      var eqBlurred = new cv.Mat();
+      try {
+        cv.GaussianBlur(eqHist, eqBlurred, new cv.Size(5, 5), 0);
+        var eqEdges = new cv.Mat();
+        try {
+          cv.Canny(eqBlurred, eqEdges, 50, 150);
+          var kernel5 = cv.Mat.ones(3, 3, cv.CV_8U);
+          cv.dilate(eqEdges, eqEdges, kernel5);
+          cv.erode(eqEdges, eqEdges, kernel5);
+          cv.dilate(eqEdges, eqEdges, kernel5);
+          kernel5.delete();
+          collectQuads(eqEdges, minArea, allCandidates, 'eqHist');
+        } finally {
+          eqEdges.delete();
+        }
+      } finally {
+        eqBlurred.delete();
+      }
+    } finally {
+      eqHist.delete();
+    }
+
     if (allCandidates.length === 0) return null;
 
     // ---- Score all candidates and pick the best ----
@@ -255,7 +281,7 @@ function findDocumentCorners(src, width, height) {
 
     for (var c = 0; c < allCandidates.length; c++) {
       var cand = allCandidates[c];
-      var score = scoreCandidate(cand.points, cand.area, imgCx, imgCy, imgArea);
+      var score = scoreCandidate(cand.points, cand.area, imgCx, imgCy, imgArea, sw, sh);
       if (score > bestScore) {
         bestScore = score;
         bestCandidate = cand;
@@ -354,11 +380,10 @@ function collectQuads(binaryMat, minArea, candidates, strategyName) {
  * 2. Size sweet spot: 10-70% of image area is ideal for a document
  * 3. Aspect ratio: close to paper formats (A4 = 1.414, Letter = 1.294)
  */
-function scoreCandidate(points, area, imgCx, imgCy, imgArea) {
+function scoreCandidate(points, area, imgCx, imgCy, imgArea, imgW, imgH) {
   var score = 0;
 
-  // --- 1. Center proximity (0-40 points) ---
-  // Centroid of the quad
+  // --- 1. Center proximity (0-35 points) ---
   var cx = 0, cy = 0;
   for (var i = 0; i < points.length; i++) {
     cx += points[i].x;
@@ -367,28 +392,27 @@ function scoreCandidate(points, area, imgCx, imgCy, imgArea) {
   cx /= 4;
   cy /= 4;
 
-  // Distance from image center, normalized to half-diagonal
   var halfDiag = Math.sqrt(imgCx * imgCx + imgCy * imgCy);
   var dist = Math.sqrt((cx - imgCx) * (cx - imgCx) + (cy - imgCy) * (cy - imgCy));
-  var centerScore = Math.max(0, 1 - dist / halfDiag) * 40;
+  var centerScore = Math.max(0, 1 - dist / halfDiag) * 35;
   score += centerScore;
 
-  // --- 2. Size sweet spot (0-35 points) ---
+  // --- 2. Size sweet spot (0-30 points) ---
   var areaRatio = area / imgArea;
-  // Ideal range: 10% to 70%. Peak around 25-45%.
-  if (areaRatio >= 0.10 && areaRatio <= 0.70) {
-    // Peak score at 35% of image
-    var sizeDist = Math.abs(areaRatio - 0.35);
-    score += (1 - sizeDist / 0.35) * 35;
-  } else if (areaRatio > 0.70) {
-    // Penalize very large quads (probably the table/background)
-    score += Math.max(0, (1 - (areaRatio - 0.70) / 0.30)) * 10;
+  // Ideal range: 5% to 80%. Peak around 20-40%.
+  if (areaRatio >= 0.05 && areaRatio <= 0.80) {
+    // Peak score at 25% of image
+    var sizeDist = Math.abs(areaRatio - 0.25);
+    score += Math.max(0, 1 - sizeDist / 0.55) * 30;
+  } else if (areaRatio > 0.80) {
+    // Heavy penalty for very large quads (table/background)
+    score += Math.max(0, (1 - (areaRatio - 0.80) / 0.20)) * 5;
   } else {
     // Too small
-    score += (areaRatio / 0.10) * 15;
+    score += (areaRatio / 0.05) * 10;
   }
 
-  // --- 3. Aspect ratio close to paper (0-25 points) ---
+  // --- 3. Aspect ratio close to paper (0-20 points) ---
   var ordered = orderCorners(points);
   var w = Math.max(
     Math.hypot(ordered.topRight.x - ordered.topLeft.x, ordered.topRight.y - ordered.topLeft.y),
@@ -400,17 +424,48 @@ function scoreCandidate(points, area, imgCx, imgCy, imgArea) {
   );
 
   if (w > 0 && h > 0) {
-    var aspect = Math.max(w, h) / Math.min(w, h); // Always >= 1
-    // Common paper: A4=1.414, Letter=1.294, A5=1.414, Legal=1.647
-    // Best score at 1.35-1.45, acceptable from 1.0 to 2.0
-    var paperTargets = [1.414, 1.294, 1.0]; // A4, Letter, Square
+    var aspect = Math.max(w, h) / Math.min(w, h);
+    var paperTargets = [1.414, 1.294, 1.0, 1.647]; // A4, Letter, Square, Legal
     var bestAspectDist = 999;
     for (var t = 0; t < paperTargets.length; t++) {
-      var d = Math.abs(aspect - paperTargets[t]);
-      if (d < bestAspectDist) bestAspectDist = d;
+      var d2 = Math.abs(aspect - paperTargets[t]);
+      if (d2 < bestAspectDist) bestAspectDist = d2;
     }
-    var aspectScore = Math.max(0, 1 - bestAspectDist / 0.8) * 25;
+    var aspectScore = Math.max(0, 1 - bestAspectDist / 0.8) * 20;
     score += aspectScore;
+  }
+
+  // --- 4. Edge proximity penalty (-20 points) ---
+  // Quads whose corners touch the image edges are likely the table/frame
+  if (imgW > 0 && imgH > 0) {
+    var edgeMargin = 0.03; // 3% of image
+    var xMin = imgW * edgeMargin;
+    var yMin = imgH * edgeMargin;
+    var xMax = imgW * (1 - edgeMargin);
+    var yMax = imgH * (1 - edgeMargin);
+
+    var cornersOnEdge = 0;
+    for (var ei = 0; ei < points.length; ei++) {
+      if (points[ei].x < xMin || points[ei].x > xMax || points[ei].y < yMin || points[ei].y > yMax) {
+        cornersOnEdge++;
+      }
+    }
+    // Penalize: -5 per corner on edge
+    score -= cornersOnEdge * 5;
+
+    // Bonus for well-inset quads (all corners > 8% from edge)
+    if (cornersOnEdge === 0) {
+      var insetMargin = 0.08;
+      var allInset = true;
+      for (var ii = 0; ii < points.length; ii++) {
+        if (points[ii].x < imgW * insetMargin || points[ii].x > imgW * (1 - insetMargin) ||
+            points[ii].y < imgH * insetMargin || points[ii].y > imgH * (1 - insetMargin)) {
+          allInset = false;
+          break;
+        }
+      }
+      if (allInset) score += 15;
+    }
   }
 
   return score;
