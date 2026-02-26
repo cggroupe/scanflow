@@ -20,16 +20,22 @@ export function useAuth() {
       created_at: string
       updated_at?: string
     }) {
-      // Try to get role from profiles table
+      // Try to get role from profiles table (with 3s timeout so we don't hang)
       let role: 'user' | 'admin' = 'user'
       try {
-        const result = await supabase!
+        const profilePromise = supabase!
           .from('profiles')
           .select('role')
           .eq('id', authUser.id)
           .single()
-        const profileRole = (result.data as { role?: string } | null)?.role
-        if (profileRole === 'admin') role = 'admin'
+        const timeoutPromise = new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), 3000),
+        )
+        const result = await Promise.race([profilePromise, timeoutPromise])
+        if (result && 'data' in result) {
+          const profileRole = (result.data as { role?: string } | null)?.role
+          if (profileRole === 'admin') role = 'admin'
+        }
       } catch {
         // profiles table may not exist yet or no row — default to 'user'
       }
@@ -55,37 +61,36 @@ export function useAuth() {
       useDocumentStore.getState().setCurrentUser(authUser.id)
     }
 
-    async function init() {
-      try {
-        // Race against a timeout — if Supabase is paused/slow, don't block the app
-        const sessionPromise = supabase!.auth.getSession()
-        const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000))
-        const result = await Promise.race([sessionPromise, timeoutPromise])
-
-        if (result && 'data' in result && result.data.session?.user) {
-          await syncProfile(result.data.session.user)
-        }
-      } catch {
-        // Session check failed (network, Supabase paused, etc.)
-      }
-      setLoading(false)
-    }
-
-    init()
+    // onAuthStateChange fires INITIAL_SESSION immediately when registered.
+    // This is our primary way to detect the user — no separate init() needed.
+    let resolved = false
 
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange(async (_event, session) => {
       if (session?.user) {
         await syncProfile(session.user)
-      } else {
+      } else if (!useAppStore.getState().user) {
+        // Only clear if no user was set (e.g. by Login.tsx directly)
         setUser(null)
         useDocumentStore.getState().setCurrentUser(null)
       }
+      resolved = true
       setLoading(false)
     })
 
-    return () => subscription.unsubscribe()
+    // Safety fallback: if onAuthStateChange never resolves (shouldn't happen),
+    // stop loading after 10s. If user was already set by Login/Register, keep it.
+    const fallbackTimeout = setTimeout(() => {
+      if (!resolved) {
+        setLoading(false)
+      }
+    }, 10000)
+
+    return () => {
+      subscription.unsubscribe()
+      clearTimeout(fallbackTimeout)
+    }
   }, [setUser])
 
   const signOut = useCallback(async () => {

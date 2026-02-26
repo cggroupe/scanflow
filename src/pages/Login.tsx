@@ -2,6 +2,8 @@ import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { supabase } from '@/lib/supabase'
+import { useAppStore } from '@/stores/appStore'
+import { useDocumentStore } from '@/stores/documentStore'
 
 export default function Login() {
   const { t } = useTranslation()
@@ -19,11 +21,31 @@ export default function Login() {
     }
     setLoading(true)
     setError(null)
-    const { error: authError } = await supabase.auth.signInWithPassword({ email, password })
+    const { data, error: authError } = await supabase.auth.signInWithPassword({ email, password })
     if (authError) {
       setError(authError.message)
       setLoading(false)
     } else {
+      // Set user in store immediately so AuthGuard sees it before navigation
+      if (data.user) {
+        useAppStore.getState().setUser({
+          id: data.user.id,
+          email: data.user.email ?? '',
+          full_name:
+            (data.user.user_metadata?.full_name as string) ??
+            (data.user.user_metadata?.name as string) ??
+            null,
+          role: 'user',
+          avatar_url:
+            (data.user.user_metadata?.avatar_url as string) ??
+            (data.user.user_metadata?.picture as string) ??
+            null,
+          locale: 'fr',
+          created_at: data.user.created_at,
+          updated_at: data.user.updated_at ?? data.user.created_at,
+        })
+        useDocumentStore.getState().setCurrentUser(data.user.id)
+      }
       navigate('/dashboard')
     }
   }
