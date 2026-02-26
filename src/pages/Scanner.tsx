@@ -49,8 +49,8 @@ function processDocumentScan(source: HTMLCanvasElement, filter: Filter, adj: Adj
   const totalPixels = w * h
 
   if (filter === 'magicColor') {
-    // ─── Photocopy Effect (v2) ───
-    // Full histogram per channel for accurate percentile calculation
+    // ─── Photocopy Effect (v3) ───
+    // Full histogram per channel
     const histR = new Uint32Array(256)
     const histG = new Uint32Array(256)
     const histB = new Uint32Array(256)
@@ -72,34 +72,43 @@ function processDocumentScan(source: HTMLCanvasElement, filter: Filter, adj: Adj
       return 255
     }
 
-    // Aggressive clipping: 0.5% – 99.5% (removes shadows & blown highlights)
-    const lows  = [histPercentile(histR, 0.005), histPercentile(histG, 0.005), histPercentile(histB, 0.005)]
-    const highs = [histPercentile(histR, 0.995), histPercentile(histG, 0.995), histPercentile(histB, 0.995)]
+    // Aggressive clipping: 2% – 96% (cuts warm shadows + pushes paper to white)
+    const lows  = [histPercentile(histR, 0.02), histPercentile(histG, 0.02), histPercentile(histB, 0.02)]
+    const highs = [histPercentile(histR, 0.96), histPercentile(histG, 0.96), histPercentile(histB, 0.96)]
 
-    // Gamma < 1.0 brightens midtones → paper becomes white
-    const gamma = 0.65
+    const gamma = 0.55          // Strong brightening — paper → white
+    const builtInContrast = 1.4 // Built-in S-curve for text/paper separation
     const brightOff = adj.brightness / 200
-    const contPow = adj.contrast !== 0 ? 1 + adj.contrast / 50 : 1
+    const userContPow = adj.contrast !== 0 ? 1 + adj.contrast / 50 : 1
 
-    // Build LUT per channel (256 entries) — O(1) per-pixel application
+    // Build LUT per channel (256 entries)
     const luts: Uint8Array[] = []
     for (let ch = 0; ch < 3; ch++) {
       const lut = new Uint8Array(256)
       const lo = lows[ch]
       const range = Math.max(1, highs[ch] - lo)
       for (let v = 0; v < 256; v++) {
-        // Percentile stretching
+        // 1. Percentile stretching
         let n = Math.max(0, Math.min(1, (v - lo) / range))
-        // Gamma correction (paper → white)
+        // 2. Gamma correction (paper → white)
         n = Math.pow(n, gamma)
-        // User brightness offset
+        // 3. Built-in S-curve contrast (always applied for photocopy look)
+        n = n < 0.5
+          ? 0.5 * Math.pow(2 * n, builtInContrast)
+          : 1 - 0.5 * Math.pow(2 * (1 - n), builtInContrast)
+        // 4. White boost — push bright values to pure white
+        if (n > 0.78) {
+          n = 0.78 + (n - 0.78) * 2.2
+          n = Math.min(1, n)
+        }
+        // 5. User brightness
         n += brightOff
         n = Math.max(0, Math.min(1, n))
-        // User contrast (S-curve)
-        if (contPow !== 1) {
+        // 6. User contrast (on top of built-in)
+        if (userContPow !== 1) {
           n = n < 0.5
-            ? 0.5 * Math.pow(2 * n, contPow)
-            : 1 - 0.5 * Math.pow(2 * (1 - n), contPow)
+            ? 0.5 * Math.pow(2 * n, userContPow)
+            : 1 - 0.5 * Math.pow(2 * (1 - n), userContPow)
         }
         lut[v] = Math.round(Math.max(0, Math.min(1, n)) * 255)
       }
@@ -293,6 +302,7 @@ export default function Scanner() {
   const [cropCanvas, setCropCanvas] = useState<HTMLCanvasElement | null>(null)
   const [cropCorners, setCropCorners] = useState<QuadCorners | null>(null)
   const [draggingCorner, setDraggingCorner] = useState<string | null>(null)
+  const [recropPageId, setRecropPageId] = useState<string | null>(null)
 
   // Per-page editing state
   const [editingPageId, setEditingPageId] = useState<string | null>(null)
@@ -413,7 +423,7 @@ export default function Scanner() {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
+        video: { facingMode: 'environment', width: { ideal: 2560 }, height: { ideal: 1920 } },
       })
       streamRef.current = stream
       setPhase('camera')
@@ -561,21 +571,47 @@ export default function Scanner() {
 
     cropCanvasWithCorners(cropCanvas, pixelCorners).then((result) => {
       const rawCanvas = result.canvas ?? cropCanvas
-      const processed = processDocumentScan(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
-      const { file, thumbnailUrl } = canvasToFileSync(processed)
-      const id = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
 
-      setPages((prev) => [...prev, { id, rawCanvas, filter: DEFAULT_FILTER, adjustments: { ...DEFAULT_ADJ }, processedFile: file, thumbnailUrl }])
-      setCropCanvas(null)
-      setCropCorners(null)
-      openCamera()
+      if (recropPageId) {
+        // Re-crop: update existing page
+        const currentPage = pages.find((p) => p.id === recropPageId)
+        const filter = currentPage?.filter ?? editFilter
+        const adjustments = currentPage?.adjustments ?? editAdj
+        const processed = processDocumentScan(rawCanvas, filter, adjustments)
+        const { file, thumbnailUrl } = canvasToFileSync(processed)
+
+        setPages((prev) => prev.map((p) =>
+          p.id === recropPageId
+            ? { ...p, rawCanvas, processedFile: file, thumbnailUrl }
+            : p
+        ))
+        setCropCanvas(null)
+        setCropCorners(null)
+        setRecropPageId(null)
+        setPhase('editPage')
+      } else {
+        // New page
+        const processed = processDocumentScan(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
+        const { file, thumbnailUrl } = canvasToFileSync(processed)
+        const id = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+
+        setPages((prev) => [...prev, { id, rawCanvas, filter: DEFAULT_FILTER, adjustments: { ...DEFAULT_ADJ }, processedFile: file, thumbnailUrl }])
+        setCropCanvas(null)
+        setCropCorners(null)
+        openCamera()
+      }
     })
   }
 
   function handleCropCancel() {
     setCropCanvas(null)
     setCropCorners(null)
-    openCamera()
+    if (recropPageId) {
+      setRecropPageId(null)
+      setPhase('editPage')
+    } else {
+      openCamera()
+    }
   }
 
   function getCropCornerAt(x: number, y: number, containerW: number, containerH: number): string | null {
@@ -711,11 +747,24 @@ export default function Scanner() {
     }
   }
 
+  function handleRecrop() {
+    if (!editingPage) return
+    setRecropPageId(editingPageId)
+    setCropCanvas(editingPage.rawCanvas)
+    setCropCorners({
+      topLeft: { x: 0.05, y: 0.05 },
+      topRight: { x: 0.95, y: 0.05 },
+      bottomRight: { x: 0.95, y: 0.95 },
+      bottomLeft: { x: 0.05, y: 0.95 },
+    })
+    setPhase('crop')
+  }
+
   function handleReset() {
     pages.forEach((p) => URL.revokeObjectURL(p.thumbnailUrl))
     setPhase('home'); setPages([]); setResultBlob(null)
     setProcessError(null); setEditingPageId(null)
-    setCropCanvas(null); setCropCorners(null)
+    setCropCanvas(null); setCropCorners(null); setRecropPageId(null)
   }
 
   // ==============================================================
@@ -765,7 +814,7 @@ export default function Scanner() {
           </svg>
         </div>
 
-        <div className="px-5 pb-8 pt-3 text-center">
+        <div className="px-5 pt-3 text-center" style={{ paddingBottom: 'calc(2rem + env(safe-area-inset-bottom, 0px))' }}>
           <p className="text-xs text-white/60">{t('scanner.dragCorners')}</p>
         </div>
       </div>
@@ -796,7 +845,7 @@ export default function Scanner() {
             <span className="material-symbols-outlined animate-spin text-3xl text-white/50">progress_activity</span>
           )}
         </div>
-        <div className="flex items-center justify-center gap-1.5 px-3 py-2">
+        <div className="flex items-center justify-center gap-1.5 px-3 py-1">
           {(['magicColor', 'original', 'grayscale', 'bw'] as Filter[]).map((f) => (
             <button key={f} onClick={() => setEditFilter(f)}
               className={`rounded-full px-3.5 py-1.5 text-xs font-medium transition-all ${editFilter === f ? 'scale-105 bg-primary text-white' : 'bg-white/15 text-white/80'}`}>
@@ -804,7 +853,13 @@ export default function Scanner() {
             </button>
           ))}
         </div>
-        <div className="space-y-2 bg-gray-900/80 px-5 pb-8 pt-3">
+        <div className="flex items-center justify-center px-3 py-1">
+          <button onClick={handleRecrop} className="flex items-center gap-1.5 rounded-full bg-white/10 px-4 py-1.5 text-xs font-medium text-white/80 active:bg-white/20">
+            <span className="material-symbols-outlined text-sm">crop</span>
+            {t('scanner.manualCrop')}
+          </button>
+        </div>
+        <div className="space-y-2 bg-gray-900/80 px-5 pt-2" style={{ paddingBottom: 'calc(1.5rem + env(safe-area-inset-bottom, 0px))' }}>
           <SliderRow icon="brightness_6" label={t('scanner.brightness')} value={editAdj.brightness} min={-60} max={60} onChange={(v) => setEditAdj((a) => ({ ...a, brightness: v }))} />
           <SliderRow icon="contrast" label={t('scanner.contrast')} value={editAdj.contrast} min={-30} max={100} onChange={(v) => setEditAdj((a) => ({ ...a, contrast: v }))} />
           <SliderRow icon="deblur" label={t('scanner.sharpness')} value={editAdj.sharpness} min={0} max={100} onChange={(v) => setEditAdj((a) => ({ ...a, sharpness: v }))} />
@@ -873,7 +928,7 @@ export default function Scanner() {
           </div>
         )}
 
-        <div className="flex items-center justify-between bg-black px-5 pb-8 pt-4">
+        <div className="flex items-center justify-between bg-black px-5 pt-4" style={{ paddingBottom: 'calc(2rem + env(safe-area-inset-bottom, 0px))' }}>
           <button onClick={() => { stopCamera(); setPhase(pages.length > 0 ? 'review' : 'home') }} className="min-w-[64px] rounded-lg px-2 py-2 text-sm font-medium text-white/80">
             {t('common.cancel')}
           </button>
