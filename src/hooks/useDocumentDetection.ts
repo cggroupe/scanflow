@@ -16,6 +16,44 @@ export interface QuadCorners {
   bottomLeft: { x: number; y: number }
 }
 
+// ---- Temporal smoothing of the live quad (anti-jitter / anti-flicker) ----
+// Without this the detection frame is redrawn raw every cycle (it trembles) and
+// is cleared the instant one frame fails to detect (it flickers). CamScanner's
+// signature is a rock-steady frame; this layer reproduces that behaviour.
+const EMA_ALPHA = 0.4 // weight of the freshly detected quad in the moving average
+const MAX_MISSES = 3 // keep the last quad for N missed cycles before clearing it
+const SNAP_DIST = 0.12 // normalized corner jump above which we snap (fast move)
+
+type Point = { x: number; y: number }
+
+function maxCornerDelta(a: QuadCorners, b: QuadCorners): number {
+  const corners: [Point, Point][] = [
+    [a.topLeft, b.topLeft],
+    [a.topRight, b.topRight],
+    [a.bottomRight, b.bottomRight],
+    [a.bottomLeft, b.bottomLeft],
+  ]
+  let max = 0
+  for (const [p, q] of corners) {
+    const d = Math.hypot(p.x - q.x, p.y - q.y)
+    if (d > max) max = d
+  }
+  return max
+}
+
+function emaQuad(prev: QuadCorners, next: QuadCorners, alpha: number): QuadCorners {
+  const blend = (p: Point, n: Point): Point => ({
+    x: p.x * (1 - alpha) + n.x * alpha,
+    y: p.y * (1 - alpha) + n.y * alpha,
+  })
+  return {
+    topLeft: blend(prev.topLeft, next.topLeft),
+    topRight: blend(prev.topRight, next.topRight),
+    bottomRight: blend(prev.bottomRight, next.bottomRight),
+    bottomLeft: blend(prev.bottomLeft, next.bottomLeft),
+  }
+}
+
 /**
  * Hook that runs OpenCV document detection in a Web Worker.
  *
@@ -32,9 +70,13 @@ export function useDocumentDetection({ enabled }: UseDocumentDetectionOptions) {
   const [liveQuad, setLiveQuad] = useState<QuadCorners | null>(null)
   const workerRef = useRef<Worker | null>(null)
   const pendingRef = useRef<((result: DetectResult) => void) | null>(null)
+  const pendingCornersRef = useRef<((quad: QuadCorners | null) => void) | null>(null)
   const liveLoopRef = useRef<number | null>(null)
   const liveBusyRef = useRef(false)
   const lastLiveTimeRef = useRef(0)
+  const smoothedQuadRef = useRef<QuadCorners | null>(null)
+  const missCountRef = useRef(0)
+  const sharpnessRef = useRef(0)
 
   // Spawn worker when camera is active, terminate when not
   useEffect(() => {
@@ -54,11 +96,33 @@ export function useDocumentDetection({ enabled }: UseDocumentDetectionOptions) {
         console.warn('[OpenCV Worker]', e.data.message)
       } else if (e.data.type === 'live-result') {
         liveBusyRef.current = false
+        sharpnessRef.current = typeof e.data.sharpness === 'number' ? e.data.sharpness : 0
         if (e.data.detected && e.data.quad) {
-          setLiveQuad(e.data.quad)
+          const detected = e.data.quad as QuadCorners
+          const prev = smoothedQuadRef.current
+          // First detection or large intentional move → snap so the frame tracks
+          // fast repositioning; otherwise blend (EMA) to absorb detector jitter.
+          const smoothed =
+            !prev || maxCornerDelta(prev, detected) > SNAP_DIST
+              ? detected
+              : emaQuad(prev, detected, EMA_ALPHA)
+          smoothedQuadRef.current = smoothed
+          missCountRef.current = 0
+          setLiveQuad(smoothed)
+        } else if (smoothedQuadRef.current && missCountRef.current < MAX_MISSES) {
+          // Missed frame: hold the last quad a few cycles to prevent flicker.
+          missCountRef.current += 1
+          setLiveQuad(smoothedQuadRef.current)
         } else {
+          smoothedQuadRef.current = null
+          missCountRef.current = 0
           setLiveQuad(null)
         }
+      } else if (e.data.type === 'corners-result') {
+        const resolve = pendingCornersRef.current
+        if (!resolve) return
+        pendingCornersRef.current = null
+        resolve(e.data.detected && e.data.quad ? (e.data.quad as QuadCorners) : null)
       } else if (e.data.type === 'result') {
         const resolve = pendingRef.current
         if (!resolve) return
@@ -97,7 +161,10 @@ export function useDocumentDetection({ enabled }: UseDocumentDetectionOptions) {
       worker.terminate()
       workerRef.current = null
       pendingRef.current = null
+      pendingCornersRef.current = null
       liveBusyRef.current = false
+      smoothedQuadRef.current = null
+      missCountRef.current = 0
       if (liveLoopRef.current) {
         cancelAnimationFrame(liveLoopRef.current)
         liveLoopRef.current = null
@@ -118,7 +185,7 @@ export function useDocumentDetection({ enabled }: UseDocumentDetectionOptions) {
         liveLoopRef.current = null
       }
 
-      const THROTTLE_MS = 400
+      const THROTTLE_MS = 140 // ~7 fps target; ROI tracking keeps each detection cheap
       const MAX_LIVE_WIDTH = 480
 
       const loop = () => {
@@ -151,7 +218,7 @@ export function useDocumentDetection({ enabled }: UseDocumentDetectionOptions) {
 
         liveBusyRef.current = true
         worker.postMessage(
-          { type: 'detect-live', pixels: pixelsCopy, width: sw, height: sh },
+          { type: 'detect-live', pixels: pixelsCopy, width: sw, height: sh, prevQuad: smoothedQuadRef.current },
           [pixelsCopy.buffer],
         )
       }
@@ -167,6 +234,8 @@ export function useDocumentDetection({ enabled }: UseDocumentDetectionOptions) {
       liveLoopRef.current = null
     }
     liveBusyRef.current = false
+    smoothedQuadRef.current = null
+    missCountRef.current = 0
     setLiveQuad(null)
   }, [])
 
@@ -249,10 +318,48 @@ export function useDocumentDetection({ enabled }: UseDocumentDetectionOptions) {
     [cvReady],
   )
 
+  /**
+   * One-shot high-resolution corner detection on a captured canvas (no crop).
+   * Used at capture time to refine the live (480p) quad into sharper corners.
+   * Resolves null if detection fails (caller falls back to the live quad).
+   */
+  const detectCorners = useCallback(
+    (sourceCanvas: HTMLCanvasElement): Promise<QuadCorners | null> => {
+      return new Promise((resolve) => {
+        const worker = workerRef.current
+        if (!worker || !cvReady) { resolve(null); return }
+
+        const w = sourceCanvas.width
+        const h = sourceCanvas.height
+        const ctx = sourceCanvas.getContext('2d', { willReadFrequently: true })
+        if (!ctx) { resolve(null); return }
+        const imageData = ctx.getImageData(0, 0, w, h)
+        const pixelsCopy = new Uint8ClampedArray(imageData.data)
+
+        pendingCornersRef.current = resolve
+
+        worker.postMessage(
+          { type: 'detect-corners', pixels: pixelsCopy, width: w, height: h },
+          [pixelsCopy.buffer],
+        )
+
+        setTimeout(() => {
+          if (pendingCornersRef.current === resolve) {
+            pendingCornersRef.current = null
+            resolve(null)
+          }
+        }, 4000)
+      })
+    },
+    [cvReady],
+  )
+
   return {
     cvReady,
     liveQuad,
+    sharpnessRef,
     detectAndCrop,
+    detectCorners,
     cropCanvasWithCorners,
     startLiveDetection,
     stopLiveDetection,

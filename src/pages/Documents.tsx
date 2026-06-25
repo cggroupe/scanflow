@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { useAppStore } from '@/stores/appStore'
 import { useDocumentStore, formatFileSize, formatRelativeDate, type StoredDocument } from '@/stores/documentStore'
 
@@ -22,6 +22,7 @@ function filterDocuments(docs: StoredDocument[], filter: string): StoredDocument
 
 export default function Documents() {
   const { t } = useTranslation()
+  const navigate = useNavigate()
   const openDrawer = useAppStore((s) => s.openDrawer)
   const documents = useDocumentStore((s) => s.documents)
   const folders = useDocumentStore((s) => s.folders)
@@ -307,7 +308,7 @@ export default function Documents() {
                 >
                   {/* Thumbnail */}
                   <button
-                    onClick={() => handleDownload(doc)}
+                    onClick={() => navigate(`/documents/${doc.id}`)}
                     className="relative h-14 w-14 shrink-0 rounded-lg border border-gray-200 bg-gray-100 transition-transform active:scale-95 dark:border-gray-700 dark:bg-gray-800"
                   >
                     <span className="material-symbols-outlined absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-xl text-gray-400">
@@ -319,7 +320,7 @@ export default function Documents() {
                   </button>
 
                   {/* Info */}
-                  <button onClick={() => handleDownload(doc)} className="min-w-0 flex-1 text-left">
+                  <button onClick={() => navigate(`/documents/${doc.id}`)} className="min-w-0 flex-1 text-left">
                     <p className="truncate text-sm font-semibold text-gray-900 dark:text-white">{doc.title}</p>
                     <p className="mt-0.5 text-xs text-gray-500">{formatRelativeDate(doc.createdAt)} &bull; {formatFileSize(doc.size)}</p>
                   </button>

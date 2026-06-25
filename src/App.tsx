@@ -6,6 +6,7 @@ import Login from '@/pages/Login'
 import Register from '@/pages/Register'
 import Dashboard from '@/pages/Dashboard'
 import Documents from '@/pages/Documents'
+import DocumentViewer from '@/pages/DocumentViewer'
 import Tools from '@/pages/Tools'
 import ToolPage from '@/pages/ToolPage'
 import Scanner from '@/pages/Scanner'
@@ -42,6 +43,7 @@ function App() {
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/documents" element={<Documents />} />
+            <Route path="/documents/:id" element={<DocumentViewer />} />
             <Route path="/tools" element={<Tools />} />
             {/* Dedicated tool pages (before generic :toolId) */}
             <Route path="/tools/sign" element={<SignPage />} />

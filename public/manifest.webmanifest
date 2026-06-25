@@ -1,0 +1,14 @@
+{
+  "name": "ScanFlow",
+  "short_name": "ScanFlow",
+  "description": "Scanner de documents — détection automatique des bords, filtres et PDF.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#ffffff",
+  "theme_color": "#2db9ad",
+  "icons": [
+    { "src": "/vite.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

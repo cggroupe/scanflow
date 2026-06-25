@@ -39,8 +39,7 @@ export const navigationItems: readonly NavItem[] = [
   { label: 'Documents', i18nKey: 'nav.documents', path: '/documents', icon: 'FileText' },
   { label: 'Scanner', i18nKey: 'nav.scanner', path: '/scanner', icon: 'Camera' },
   { label: 'Tools', i18nKey: 'nav.tools', path: '/tools', icon: 'Wrench' },
-  { label: 'Projects', i18nKey: 'nav.projects', path: '/projects', icon: 'FolderOpen' },
-  { label: 'Trash', i18nKey: 'nav.trash', path: '/trash', icon: 'Trash2' },
+  // Projects (/projects) and Trash (/trash) removed: no routes exist yet → were 404s.
 ]
 
 export const toolCategories: readonly ToolCategory[] = [

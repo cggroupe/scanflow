@@ -167,8 +167,24 @@
     "unlock": "Unlock",
     "redact": "Redact"
   },
+  "viewer": {
+    "download": "Download",
+    "share": "Share",
+    "delete": "Delete",
+    "back": "Back",
+    "loading": "Loading…",
+    "unavailable": "File unavailable (not stored on this device)",
+    "notFound": "Document not found"
+  },
   "scanner": {
     "title": "Scanner",
+    "capture": "Capture",
+    "autoCapture": "Auto-capture",
+    "autoCapturing": "Auto-capturing…",
+    "torch": "Torch",
+    "scanMode": "Scan mode",
+    "adjustFraming": "Adjust framing",
+    "tooBlurry": "Too blurry — hold steady",
     "scanDocument": "Scan a document",
     "scanDescription": "Take a photo or import a file",
     "homeDescription": "Scan your documents in high quality with automatic edge detection",

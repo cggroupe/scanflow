@@ -62,8 +62,7 @@ export default function ToolPage() {
           type: 'pdf',
           size: processResult.blob.size,
           createdAt: new Date().toISOString(),
-          blobUrl: URL.createObjectURL(processResult.blob),
-        })
+        }, processResult.blob)
       } else {
         processResult.files.forEach((f, i) => {
           addDocument({
@@ -72,8 +71,7 @@ export default function ToolPage() {
             type: f.fileName.endsWith('.jpg') ? 'jpg' : 'pdf',
             size: f.blob.size,
             createdAt: new Date().toISOString(),
-            blobUrl: URL.createObjectURL(f.blob),
-          })
+          }, f.blob)
         })
       }
     }

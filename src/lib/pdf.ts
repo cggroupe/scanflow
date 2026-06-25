@@ -131,10 +131,39 @@ export async function extractPages(file: File, indices: number[]): Promise<Uint8
   return doc.save()
 }
 
-/** Re-save the PDF with object streams (basic compression). */
+/**
+ * Compress a PDF by rasterizing each page to a ~150 DPI JPEG and rebuilding the
+ * document at the original page size (lossy — text becomes an image). Falls back
+ * to an object-stream re-save, and never returns something larger than the input.
+ */
 export async function compressPdf(file: File): Promise<Uint8Array> {
-  const pdf = await PDFDocument.load(await file.arrayBuffer())
-  return pdf.save({ useObjectStreams: true })
+  const original = new Uint8Array(await file.arrayBuffer())
+  const pdf = await getDocument({ data: new Uint8Array(original) }).promise
+  const out = await PDFDocument.create()
+  const TARGET_DPI = 150
+  try {
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i)
+      const pts = page.getViewport({ scale: 1 }) // points = px at 72 DPI
+      const viewport = page.getViewport({ scale: TARGET_DPI / 72 })
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.max(1, Math.round(viewport.width))
+      canvas.height = Math.max(1, Math.round(viewport.height))
+      await page.render({ canvas, canvasContext: canvas.getContext('2d')!, viewport }).promise
+      const jpegBlob = await new Promise<Blob>((res) => canvas.toBlob((b) => res(b!), 'image/jpeg', 0.6))
+      const jpg = await out.embedJpg(await jpegBlob.arrayBuffer())
+      const p = out.addPage([pts.width, pts.height])
+      p.drawImage(jpg, { x: 0, y: 0, width: pts.width, height: pts.height })
+    }
+  } finally {
+    pdf.destroy()
+  }
+  const compressed = await out.save()
+  if (compressed.byteLength < original.byteLength) return compressed
+
+  // Rasterizing didn't help (e.g. already-optimized scan) — try a plain re-save.
+  const reSaved = await (await PDFDocument.load(original)).save({ useObjectStreams: true })
+  return reSaved.byteLength < original.byteLength ? reSaved : original
 }
 
 /** Convert images (JPEG / PNG / WebP) into a single PDF. */

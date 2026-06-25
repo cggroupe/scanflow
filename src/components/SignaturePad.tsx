@@ -18,8 +18,9 @@ export default function SignaturePad({ width = 360, height = 180, onSignature }:
     const canvas = canvasRef.current
     if (!canvas) return
     const ctx = canvas.getContext('2d')!
-    ctx.fillStyle = '#ffffff'
-    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    // Keep the canvas transparent: a white fill would be baked into the PNG and
+    // paint an opaque box over the document under the signature.
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
     ctx.strokeStyle = '#1a1a1a'
     ctx.lineWidth = 2.5
     ctx.lineCap = 'round'
@@ -61,8 +62,7 @@ export default function SignaturePad({ width = 360, height = 180, onSignature }:
   const handleClear = useCallback(() => {
     const canvas = canvasRef.current!
     const ctx = canvas.getContext('2d')!
-    ctx.fillStyle = '#ffffff'
-    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
     setHasStrokes(false)
   }, [])
 

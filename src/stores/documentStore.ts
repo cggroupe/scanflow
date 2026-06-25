@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { putBlob, getBlob, deleteBlob } from '@/lib/blobStore'
 
 // ================================================================
 // Types
@@ -11,7 +12,7 @@ export interface StoredDocument {
   size: number            // bytes
   createdAt: string       // ISO date
   folderId?: string       // optional folder assignment
-  /** object URL (won't survive page reload) */
+  /** runtime object URL — rehydrated from IndexedDB on load (see lib/blobStore) */
   blobUrl?: string
 }
 
@@ -32,7 +33,8 @@ interface DocumentState {
   /** Call when user logs in/out to load the right data */
   setCurrentUser: (userId: string | null) => void
 
-  addDocument: (doc: StoredDocument) => void
+  /** Add a document. Pass its binary as `blob` to persist it (survives reload). */
+  addDocument: (doc: StoredDocument, blob?: Blob) => void
   removeDocument: (id: string) => void
   moveToFolder: (docId: string, folderId: string | undefined) => void
   setPendingFile: (file: File | null) => void
@@ -100,23 +102,54 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   pendingFile: null,
 
   setCurrentUser: (userId) => {
+    // Revoke URLs from the previous session to avoid leaks
+    get().documents.forEach((d) => { if (d.blobUrl) URL.revokeObjectURL(d.blobUrl) })
+
+    const documents = loadDocuments(userId)
     set({
       currentUserId: userId,
-      documents: loadDocuments(userId),
+      documents,
       folders: loadFolders(userId),
       pendingFile: null,
     })
+
+    // Rehydrate file binaries from IndexedDB so documents survive a page reload.
+    // Runs async: blobUrls fill in as each blob is read; UI updates progressively.
+    void (async () => {
+      for (const doc of documents) {
+        if (get().currentUserId !== userId) return // user switched mid-hydration
+        const current = get().documents.find((d) => d.id === doc.id)
+        if (!current || current.blobUrl) continue
+        const blob = await getBlob(doc.id)
+        if (!blob) continue
+        if (get().currentUserId !== userId) return
+        const url = URL.createObjectURL(blob)
+        set((state) => ({
+          documents: state.documents.map((d) =>
+            d.id === doc.id && !d.blobUrl ? { ...d, blobUrl: url } : d,
+          ),
+        }))
+      }
+    })()
   },
 
-  addDocument: (doc) => {
+  addDocument: (doc, blob) => {
     const { currentUserId } = get()
-    const next = [doc, ...get().documents]
+    let stored = doc
+    if (blob) {
+      void putBlob(doc.id, blob)
+      if (!stored.blobUrl) stored = { ...stored, blobUrl: URL.createObjectURL(blob) }
+    }
+    const next = [stored, ...get().documents]
     saveDocuments(next, currentUserId)
     set({ documents: next })
   },
 
   removeDocument: (id) => {
     const { currentUserId } = get()
+    const target = get().documents.find((d) => d.id === id)
+    if (target?.blobUrl) URL.revokeObjectURL(target.blobUrl)
+    void deleteBlob(id)
     const next = get().documents.filter((d) => d.id !== id)
     saveDocuments(next, currentUserId)
     set({ documents: next })
@@ -159,7 +192,11 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   },
 
   clearAllData: () => {
-    const { currentUserId } = get()
+    const { currentUserId, documents } = get()
+    documents.forEach((d) => {
+      if (d.blobUrl) URL.revokeObjectURL(d.blobUrl)
+      void deleteBlob(d.id)
+    })
     localStorage.removeItem(docsKey(currentUserId))
     localStorage.removeItem(foldersKey(currentUserId))
     set({ documents: [], folders: [], pendingFile: null })

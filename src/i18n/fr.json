@@ -167,8 +167,24 @@
     "unlock": "Déverrouiller",
     "redact": "Caviarder"
   },
+  "viewer": {
+    "download": "Télécharger",
+    "share": "Partager",
+    "delete": "Supprimer",
+    "back": "Retour",
+    "loading": "Chargement…",
+    "unavailable": "Fichier indisponible (non enregistré sur cet appareil)",
+    "notFound": "Document introuvable"
+  },
   "scanner": {
     "title": "Scanner",
+    "capture": "Capturer",
+    "autoCapture": "Capture auto",
+    "autoCapturing": "Capture auto…",
+    "torch": "Lampe",
+    "scanMode": "Mode de scan",
+    "adjustFraming": "Ajustez le cadrage",
+    "tooBlurry": "Trop flou — stabilisez",
     "scanDocument": "Scanner un document",
     "scanDescription": "Prenez une photo ou importez un fichier",
     "homeDescription": "Scannez vos documents en haute qualité avec détection automatique des bords",

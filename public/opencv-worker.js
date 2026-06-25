@@ -31,17 +31,29 @@ var Module = {
   },
 };
 
-try {
-  importScripts('https://docs.opencv.org/4.9.0/opencv.js');
-  if (!cvReady && !cv) {
-    cv = self.cv || self.Module || Module;
-    if (cv && typeof cv.Mat === 'function') {
-      cvReady = true;
-      postMessage({ type: 'ready' });
+// Prefer a self-hosted /opencv.js (works offline + tighter CSP); fall back to the
+// CDN if it isn't present. To self-host, drop opencv.js 4.9.0 into public/.
+function loadOpenCv() {
+  try {
+    importScripts('/opencv.js');
+    return true;
+  } catch (eLocal) {
+    try {
+      importScripts('https://docs.opencv.org/4.9.0/opencv.js');
+      return true;
+    } catch (eCdn) {
+      postMessage({ type: 'error', message: 'importScripts failed: ' + eCdn.message });
+      return false;
     }
   }
-} catch (e) {
-  postMessage({ type: 'error', message: 'importScripts failed: ' + e.message });
+}
+
+if (loadOpenCv() && !cvReady && !cv) {
+  cv = self.cv || self.Module || Module;
+  if (cv && typeof cv.Mat === 'function') {
+    cvReady = true;
+    postMessage({ type: 'ready' });
+  }
 }
 
 onmessage = function (e) {
@@ -70,26 +82,43 @@ onmessage = function (e) {
       return;
     }
 
-    // ---- detect-live: return corners only (no perspective correction) ----
+    // ---- detect-live: corners (normalized) + sharpness, with ROI tracking ----
     if (msgType === 'detect-live') {
       var imageData = new ImageData(new Uint8ClampedArray(pixels), width, height);
       var src = cv.matFromImageData(imageData);
       try {
-        var corners = findDocumentCorners(src, width, height);
-        if (corners) {
-          // Return corners as normalized percentages (0-1)
-          var quad = {
-            topLeft:     { x: corners.points.topLeft.x / width,     y: corners.points.topLeft.y / height },
-            topRight:    { x: corners.points.topRight.x / width,    y: corners.points.topRight.y / height },
-            bottomRight: { x: corners.points.bottomRight.x / width, y: corners.points.bottomRight.y / height },
-            bottomLeft:  { x: corners.points.bottomLeft.x / width,  y: corners.points.bottomLeft.y / height },
-          };
-          postMessage({ type: 'live-result', detected: true, quad: quad, debug: corners.debug });
+        var sharpness = computeSharpness(src);
+        var det = detectLiveTracked(src, width, height, e.data.prevQuad || null);
+        if (det) {
+          postMessage({ type: 'live-result', detected: true, quad: det.quad, sharpness: sharpness, tracked: det.tracked, debug: det.debug });
         } else {
-          postMessage({ type: 'live-result', detected: false, debug: 'no document found' });
+          postMessage({ type: 'live-result', detected: false, sharpness: sharpness });
         }
       } finally {
         src.delete();
+      }
+      return;
+    }
+
+    // ---- detect-corners: one-shot high-res corner detection (no crop) ----
+    if (msgType === 'detect-corners') {
+      var imageDataC = new ImageData(new Uint8ClampedArray(pixels), width, height);
+      var srcC = cv.matFromImageData(imageDataC);
+      try {
+        var cornersC = findDocumentCorners(srcC, width, height, { live: false, maxDim: 1280 });
+        if (cornersC) {
+          var quadC = {
+            topLeft:     { x: cornersC.points.topLeft.x / width,     y: cornersC.points.topLeft.y / height },
+            topRight:    { x: cornersC.points.topRight.x / width,    y: cornersC.points.topRight.y / height },
+            bottomRight: { x: cornersC.points.bottomRight.x / width, y: cornersC.points.bottomRight.y / height },
+            bottomLeft:  { x: cornersC.points.bottomLeft.x / width,  y: cornersC.points.bottomLeft.y / height },
+          };
+          postMessage({ type: 'corners-result', detected: true, quad: quadC, debug: cornersC.debug });
+        } else {
+          postMessage({ type: 'corners-result', detected: false, debug: 'no document found' });
+        }
+      } finally {
+        srcC.delete();
       }
       return;
     }
@@ -139,7 +168,7 @@ function detectAndCrop(pixels, width, height) {
   var src = cv.matFromImageData(imageData);
 
   try {
-    var corners = findDocumentCorners(src, width, height);
+    var corners = findDocumentCorners(src, width, height, { live: false, maxDim: 1280 });
     if (!corners) return null;
     var corrected = perspectiveCorrect(src, corners.points);
     if (corrected) {
@@ -151,12 +180,142 @@ function detectAndCrop(pixels, width, height) {
   }
 }
 
+/**
+ * Gradient-magnitude (Sobel) fallback. Amplifies faint borders that Canny misses
+ * on low-contrast scenes (white sheet on a light desk), then reuses collectQuads
+ * so only valid convex quads are produced.
+ */
+function collectGradientQuads(grayMat, minArea, candidates, epsilons) {
+  var gradX = new cv.Mat();
+  var gradY = new cv.Mat();
+  var absX = new cv.Mat();
+  var absY = new cv.Mat();
+  var grad = new cv.Mat();
+  var edges = new cv.Mat();
+  try {
+    cv.Sobel(grayMat, gradX, cv.CV_16S, 1, 0, 3);
+    cv.Sobel(grayMat, gradY, cv.CV_16S, 0, 1, 3);
+    cv.convertScaleAbs(gradX, absX);
+    cv.convertScaleAbs(gradY, absY);
+    cv.addWeighted(absX, 0.5, absY, 0.5, 0, grad);
+    cv.threshold(grad, edges, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+    var kernel = cv.Mat.ones(3, 3, cv.CV_8U);
+    cv.dilate(edges, edges, kernel);
+    cv.erode(edges, edges, kernel);
+    cv.dilate(edges, edges, kernel);
+    kernel.delete();
+    collectQuads(edges, minArea, candidates, 'gradient', epsilons);
+  } finally {
+    gradX.delete();
+    gradY.delete();
+    absX.delete();
+    absY.delete();
+    grad.delete();
+    edges.delete();
+  }
+}
+
+// ============================================================
+// Engine v2: live tracking + sharpness
+// ============================================================
+
+var TRACK_MARGIN = 0.14; // ROI expansion around the previous quad (fraction)
+
+function normQuad(points, width, height) {
+  return {
+    topLeft:     { x: points.topLeft.x / width,     y: points.topLeft.y / height },
+    topRight:    { x: points.topRight.x / width,    y: points.topRight.y / height },
+    bottomRight: { x: points.bottomRight.x / width, y: points.bottomRight.y / height },
+    bottomLeft:  { x: points.bottomLeft.x / width,  y: points.bottomLeft.y / height },
+  };
+}
+
+function quadInUnit(q) {
+  var ks = ['topLeft', 'topRight', 'bottomRight', 'bottomLeft'];
+  for (var i = 0; i < ks.length; i++) {
+    var p = q[ks[i]];
+    if (p.x < -0.02 || p.x > 1.02 || p.y < -0.02 || p.y > 1.02) return false;
+  }
+  return true;
+}
+
+/** Variance of the Laplacian — higher = sharper (lower = motion-blurred). */
+function computeSharpness(src) {
+  var gray = new cv.Mat();
+  var lap = new cv.Mat();
+  var mean = new cv.Mat();
+  var std = new cv.Mat();
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.Laplacian(gray, lap, cv.CV_64F);
+    cv.meanStdDev(lap, mean, std);
+    var s = std.doubleAt(0, 0);
+    return s * s;
+  } catch (e) {
+    return 0;
+  } finally {
+    gray.delete();
+    lap.delete();
+    mean.delete();
+    std.delete();
+  }
+}
+
+/**
+ * Detect the document quad. When a previous quad is known, search only a ROI
+ * around it (fast + stable frame-to-frame tracking); otherwise scan the full
+ * frame. Always falls back to a full scan if ROI tracking finds nothing valid.
+ */
+function detectLiveTracked(src, width, height, prevQuad) {
+  if (prevQuad) {
+    var minx = Math.min(prevQuad.topLeft.x, prevQuad.bottomLeft.x);
+    var maxx = Math.max(prevQuad.topRight.x, prevQuad.bottomRight.x);
+    var miny = Math.min(prevQuad.topLeft.y, prevQuad.topRight.y);
+    var maxy = Math.max(prevQuad.bottomLeft.y, prevQuad.bottomRight.y);
+    var ew = (maxx - minx) * TRACK_MARGIN;
+    var eh = (maxy - miny) * TRACK_MARGIN;
+    var rx = Math.max(0, Math.floor((minx - ew) * width));
+    var ry = Math.max(0, Math.floor((miny - eh) * height));
+    var rw = Math.min(width - rx, Math.ceil((maxx - minx + 2 * ew) * width));
+    var rh = Math.min(height - ry, Math.ceil((maxy - miny + 2 * eh) * height));
+
+    if (rw > 40 && rh > 40 && (rw < width || rh < height)) {
+      var roi = src.roi(new cv.Rect(rx, ry, rw, rh));
+      try {
+        var rc = findDocumentCorners(roi, rw, rh, { live: true });
+        if (rc) {
+          var mapped = {
+            topLeft:     { x: rc.points.topLeft.x + rx,     y: rc.points.topLeft.y + ry },
+            topRight:    { x: rc.points.topRight.x + rx,    y: rc.points.topRight.y + ry },
+            bottomRight: { x: rc.points.bottomRight.x + rx, y: rc.points.bottomRight.y + ry },
+            bottomLeft:  { x: rc.points.bottomLeft.x + rx,  y: rc.points.bottomLeft.y + ry },
+          };
+          var nq = normQuad(mapped, width, height);
+          if (quadInUnit(nq)) {
+            return { quad: nq, tracked: true, debug: 'track ' + rc.debug };
+          }
+        }
+      } finally {
+        roi.delete();
+      }
+    }
+  }
+
+  var fc = findDocumentCorners(src, width, height, { live: true });
+  if (!fc) return null;
+  return { quad: normQuad(fc.points, width, height), tracked: false, debug: fc.debug };
+}
+
 // ============================================================
 // Multi-strategy document corner detection
 // ============================================================
 
-function findDocumentCorners(src, width, height) {
-  var scale = Math.min(1, 640 / Math.max(width, height));
+function findDocumentCorners(src, width, height, opts) {
+  opts = opts || {};
+  var live = !!opts.live;
+  var maxDim = opts.maxDim || 640; // one-shot capture passes a higher value for sharper corners
+
+  var scale = Math.min(1, maxDim / Math.max(width, height));
   var sw = Math.round(width * scale);
   var sh = Math.round(height * scale);
 
@@ -177,8 +336,23 @@ function findDocumentCorners(src, width, height) {
     // Collect ALL candidate quads from all strategies, then pick the best
     var allCandidates = [];
 
+    // Live mode runs fewer strategies/epsilons and exits early once a strong quad
+    // is found — keeps the ~400ms loop cheap on mid-range mobiles (was 9 strategies
+    // x 6 epsilons every frame). One-shot capture runs the full pipeline.
+    var eps = live ? [0.02, 0.04, 0.06] : [0.02, 0.03, 0.04, 0.05, 0.06, 0.08];
+    var EARLY_EXIT = 82;
+    var done = false;
+    function bestScoreSoFar() {
+      var b = -Infinity;
+      for (var k = 0; k < allCandidates.length; k++) {
+        var s = scoreCandidate(allCandidates[k].points, allCandidates[k].area, imgCx, imgCy, imgArea, sw, sh);
+        if (s > b) b = s;
+      }
+      return b;
+    }
+
     // ---- Strategy 1: Canny edge detection ----
-    var cannyThresholds = [[50, 150], [30, 100], [75, 200]];
+    var cannyThresholds = live ? [[50, 150]] : [[50, 150], [30, 100], [75, 200]];
     for (var ct = 0; ct < cannyThresholds.length; ct++) {
       var edges = new cv.Mat();
       try {
@@ -188,89 +362,107 @@ function findDocumentCorners(src, width, height) {
         cv.erode(edges, edges, kernel);
         cv.dilate(edges, edges, kernel);
         kernel.delete();
-        collectQuads(edges, minArea, allCandidates, 'canny[' + cannyThresholds[ct].join(',') + ']');
+        collectQuads(edges, minArea, allCandidates, 'canny[' + cannyThresholds[ct].join(',') + ']', eps);
       } finally {
         edges.delete();
       }
     }
+    if (live && bestScoreSoFar() >= EARLY_EXIT) done = true;
 
     // ---- Strategy 2: Adaptive threshold ----
-    var adaptiveTypes = [
-      { blockSize: 15, C: 5 },
-      { blockSize: 25, C: 8 },
-      { blockSize: 11, C: 3 },
-    ];
-    for (var at = 0; at < adaptiveTypes.length; at++) {
-      var thresh = new cv.Mat();
-      try {
-        cv.adaptiveThreshold(blurred, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, adaptiveTypes[at].blockSize, adaptiveTypes[at].C);
-        var kernel2 = cv.Mat.ones(3, 3, cv.CV_8U);
-        cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, kernel2);
-        cv.dilate(thresh, thresh, kernel2);
-        kernel2.delete();
-        collectQuads(thresh, minArea, allCandidates, 'adapt[' + adaptiveTypes[at].blockSize + ']');
-      } finally {
-        thresh.delete();
+    if (!done) {
+      var adaptiveTypes = live ? [{ blockSize: 15, C: 5 }] : [
+        { blockSize: 15, C: 5 },
+        { blockSize: 25, C: 8 },
+        { blockSize: 11, C: 3 },
+      ];
+      for (var at = 0; at < adaptiveTypes.length; at++) {
+        var thresh = new cv.Mat();
+        try {
+          cv.adaptiveThreshold(blurred, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, adaptiveTypes[at].blockSize, adaptiveTypes[at].C);
+          var kernel2 = cv.Mat.ones(3, 3, cv.CV_8U);
+          cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, kernel2);
+          cv.dilate(thresh, thresh, kernel2);
+          kernel2.delete();
+          collectQuads(thresh, minArea, allCandidates, 'adapt[' + adaptiveTypes[at].blockSize + ']', eps);
+        } finally {
+          thresh.delete();
+        }
       }
+      if (live && bestScoreSoFar() >= EARLY_EXIT) done = true;
     }
 
     // ---- Strategy 3: Otsu threshold ----
-    var otsu = new cv.Mat();
-    try {
-      cv.threshold(blurred, otsu, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
-      var kernel3 = cv.Mat.ones(5, 5, cv.CV_8U);
-      cv.morphologyEx(otsu, otsu, cv.MORPH_CLOSE, kernel3);
-      cv.dilate(otsu, otsu, kernel3);
-      kernel3.delete();
-      collectQuads(otsu, minArea, allCandidates, 'otsu');
-    } finally {
-      otsu.delete();
-    }
-
-    // ---- Strategy 4: Heavy blur + Canny ----
-    var heavyBlur = new cv.Mat();
-    try {
-      cv.GaussianBlur(gray, heavyBlur, new cv.Size(11, 11), 0);
-      var edges2 = new cv.Mat();
+    if (!done) {
+      var otsu = new cv.Mat();
       try {
-        cv.Canny(heavyBlur, edges2, 40, 120);
-        var kernel4 = cv.Mat.ones(5, 5, cv.CV_8U);
-        cv.dilate(edges2, edges2, kernel4);
-        cv.erode(edges2, edges2, kernel4);
-        cv.dilate(edges2, edges2, kernel4);
-        kernel4.delete();
-        collectQuads(edges2, minArea, allCandidates, 'heavyBlur');
+        cv.threshold(blurred, otsu, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+        var kernel3 = cv.Mat.ones(5, 5, cv.CV_8U);
+        cv.morphologyEx(otsu, otsu, cv.MORPH_CLOSE, kernel3);
+        cv.dilate(otsu, otsu, kernel3);
+        kernel3.delete();
+        collectQuads(otsu, minArea, allCandidates, 'otsu', eps);
       } finally {
-        edges2.delete();
+        otsu.delete();
       }
-    } finally {
-      heavyBlur.delete();
+      if (live && bestScoreSoFar() >= EARLY_EXIT) done = true;
     }
 
-    // ---- Strategy 5: Histogram equalization + Canny (uneven lighting) ----
-    var eqHist = new cv.Mat();
-    try {
-      cv.equalizeHist(gray, eqHist);
-      var eqBlurred = new cv.Mat();
+    // ---- Strategies 4 & 5: full pipeline only (too costly for the live loop) ----
+    if (!live && !done) {
+      // Strategy 4: Heavy blur + Canny (textured backgrounds)
+      var heavyBlur = new cv.Mat();
       try {
-        cv.GaussianBlur(eqHist, eqBlurred, new cv.Size(5, 5), 0);
-        var eqEdges = new cv.Mat();
+        cv.GaussianBlur(gray, heavyBlur, new cv.Size(11, 11), 0);
+        var edges2 = new cv.Mat();
         try {
-          cv.Canny(eqBlurred, eqEdges, 50, 150);
-          var kernel5 = cv.Mat.ones(3, 3, cv.CV_8U);
-          cv.dilate(eqEdges, eqEdges, kernel5);
-          cv.erode(eqEdges, eqEdges, kernel5);
-          cv.dilate(eqEdges, eqEdges, kernel5);
-          kernel5.delete();
-          collectQuads(eqEdges, minArea, allCandidates, 'eqHist');
+          cv.Canny(heavyBlur, edges2, 40, 120);
+          var kernel4 = cv.Mat.ones(5, 5, cv.CV_8U);
+          cv.dilate(edges2, edges2, kernel4);
+          cv.erode(edges2, edges2, kernel4);
+          cv.dilate(edges2, edges2, kernel4);
+          kernel4.delete();
+          collectQuads(edges2, minArea, allCandidates, 'heavyBlur', eps);
         } finally {
-          eqEdges.delete();
+          edges2.delete();
         }
       } finally {
-        eqBlurred.delete();
+        heavyBlur.delete();
       }
-    } finally {
-      eqHist.delete();
+
+      // Strategy 5: Histogram equalization + Canny (uneven lighting)
+      var eqHist = new cv.Mat();
+      try {
+        cv.equalizeHist(gray, eqHist);
+        var eqBlurred = new cv.Mat();
+        try {
+          cv.GaussianBlur(eqHist, eqBlurred, new cv.Size(5, 5), 0);
+          var eqEdges = new cv.Mat();
+          try {
+            cv.Canny(eqBlurred, eqEdges, 50, 150);
+            var kernel5 = cv.Mat.ones(3, 3, cv.CV_8U);
+            cv.dilate(eqEdges, eqEdges, kernel5);
+            cv.erode(eqEdges, eqEdges, kernel5);
+            cv.dilate(eqEdges, eqEdges, kernel5);
+            kernel5.delete();
+            collectQuads(eqEdges, minArea, allCandidates, 'eqHist', eps);
+          } finally {
+            eqEdges.delete();
+          }
+        } finally {
+          eqBlurred.delete();
+        }
+      } finally {
+        eqHist.delete();
+      }
+    }
+
+    // ---- Last-resort fallback: gradient-magnitude edges for low-contrast scenes
+    //      (white paper on a light desk where Canny finds no border). Reuses
+    //      collectQuads, so it can only ADD valid convex quads — runs only when
+    //      every other strategy came up empty, so it can't degrade working cases. ----
+    if (allCandidates.length === 0) {
+      collectGradientQuads(gray, minArea, allCandidates, eps);
     }
 
     if (allCandidates.length === 0) return null;
@@ -309,7 +501,8 @@ function findDocumentCorners(src, width, height) {
 /**
  * Find all valid quadrilaterals in a binary image and add them to candidates array.
  */
-function collectQuads(binaryMat, minArea, candidates, strategyName) {
+function collectQuads(binaryMat, minArea, candidates, strategyName, epsilons) {
+  epsilons = epsilons || [0.02, 0.03, 0.04, 0.05, 0.06, 0.08];
   var contours = new cv.MatVector();
   var hierarchy = new cv.Mat();
 
@@ -324,6 +517,7 @@ function collectQuads(binaryMat, minArea, candidates, strategyName) {
     for (var i = 0; i < count; i++) {
       var contour = contours.get(i);
       var area = cv.contourArea(contour);
+      contour.delete(); // FIX: every contours.get() allocates a WASM Mat that must be freed
       if (area >= minArea) {
         contourInfos.push({ index: i, area: area });
       }
@@ -331,39 +525,45 @@ function collectQuads(binaryMat, minArea, candidates, strategyName) {
     contourInfos.sort(function (a, b) { return b.area - a.area; });
     if (contourInfos.length > 15) contourInfos = contourInfos.slice(0, 15);
 
-    var epsilons = [0.02, 0.03, 0.04, 0.05, 0.06, 0.08];
-
     for (var ci = 0; ci < contourInfos.length; ci++) {
-      for (var e = 0; e < epsilons.length; e++) {
-        var contour2 = contours.get(contourInfos[ci].index);
-        var peri = cv.arcLength(contour2, true);
-        var approx = new cv.Mat();
+      // FIX: fetch the contour Mat ONCE per contour (not per epsilon) and free it
+      // in finally. Previously contours.get() was called 6x/contour and never freed,
+      // leaking ~90 WASM Mats per collectQuads call (9 calls/detection, every ~400ms).
+      var contour2 = contours.get(contourInfos[ci].index);
+      var peri = cv.arcLength(contour2, true);
 
-        try {
-          cv.approxPolyDP(contour2, approx, epsilons[e] * peri, true);
+      try {
+        for (var e = 0; e < epsilons.length; e++) {
+          var approx = new cv.Mat();
 
-          if (approx.rows === 4) {
-            if (!cv.isContourConvex(approx)) continue;
+          try {
+            cv.approxPolyDP(contour2, approx, epsilons[e] * peri, true);
 
-            var points = [];
-            for (var j = 0; j < 4; j++) {
-              points.push({
-                x: approx.data32S[j * 2],
-                y: approx.data32S[j * 2 + 1],
-              });
+            if (approx.rows === 4) {
+              if (!cv.isContourConvex(approx)) continue;
+
+              var points = [];
+              for (var j = 0; j < 4; j++) {
+                points.push({
+                  x: approx.data32S[j * 2],
+                  y: approx.data32S[j * 2 + 1],
+                });
+              }
+
+              if (hasReasonableAngles(points)) {
+                candidates.push({
+                  points: points,
+                  area: contourInfos[ci].area,
+                  strategy: strategyName + '/eps=' + epsilons[e],
+                });
+              }
             }
-
-            if (hasReasonableAngles(points)) {
-              candidates.push({
-                points: points,
-                area: contourInfos[ci].area,
-                strategy: strategyName + '/eps=' + epsilons[e],
-              });
-            }
+          } finally {
+            approx.delete();
           }
-        } finally {
-          approx.delete();
         }
+      } finally {
+        contour2.delete();
       }
     }
   } finally {
@@ -505,21 +705,54 @@ function hasReasonableAngles(pts) {
 // ============================================================
 
 function perspectiveCorrect(src, corners) {
-  var widthTop = Math.hypot(corners.topRight.x - corners.topLeft.x, corners.topRight.y - corners.topLeft.y);
-  var widthBottom = Math.hypot(corners.bottomRight.x - corners.bottomLeft.x, corners.bottomRight.y - corners.bottomLeft.y);
-  var heightLeft = Math.hypot(corners.bottomLeft.x - corners.topLeft.x, corners.bottomLeft.y - corners.topLeft.y);
-  var heightRight = Math.hypot(corners.bottomRight.x - corners.topRight.x, corners.bottomRight.y - corners.topRight.y);
+  // Expand the quad slightly (1.5%) so we don't clip the document edge, clamped to
+  // the image bounds so warpPerspective never samples outside (no black border).
+  var MARGIN = 0.015;
+  var maxX = src.cols - 1;
+  var maxY = src.rows - 1;
+  var ccx = (corners.topLeft.x + corners.topRight.x + corners.bottomRight.x + corners.bottomLeft.x) / 4;
+  var ccy = (corners.topLeft.y + corners.topRight.y + corners.bottomRight.y + corners.bottomLeft.y) / 4;
+  function expand(p) {
+    return {
+      x: Math.max(0, Math.min(maxX, p.x + (p.x - ccx) * MARGIN)),
+      y: Math.max(0, Math.min(maxY, p.y + (p.y - ccy) * MARGIN)),
+    };
+  }
+  var tl = expand(corners.topLeft);
+  var tr = expand(corners.topRight);
+  var br = expand(corners.bottomRight);
+  var bl = expand(corners.bottomLeft);
+
+  var widthTop = Math.hypot(tr.x - tl.x, tr.y - tl.y);
+  var widthBottom = Math.hypot(br.x - bl.x, br.y - bl.y);
+  var heightLeft = Math.hypot(bl.x - tl.x, bl.y - tl.y);
+  var heightRight = Math.hypot(br.x - tr.x, br.y - tr.y);
 
   var outW = Math.round(Math.max(widthTop, widthBottom));
   var outH = Math.round(Math.max(heightLeft, heightRight));
 
   if (outW < 50 || outH < 50) return null;
 
+  // Snap the aspect ratio to A4 / US-Letter when it's close, so a near-A4 scan
+  // comes out cleanly proportioned instead of subtly skewed.
+  var longSide = Math.max(outW, outH);
+  var shortSide = Math.min(outW, outH);
+  var aspect = longSide / shortSide;
+  var targets = [1.41421, 1.29412]; // A4, Letter
+  for (var ti = 0; ti < targets.length; ti++) {
+    if (Math.abs(aspect - targets[ti]) < 0.06) {
+      shortSide = Math.round(longSide / targets[ti]);
+      break;
+    }
+  }
+  if (outH >= outW) { outH = longSide; outW = shortSide; }
+  else { outW = longSide; outH = shortSide; }
+
   var srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
-    corners.topLeft.x, corners.topLeft.y,
-    corners.topRight.x, corners.topRight.y,
-    corners.bottomRight.x, corners.bottomRight.y,
-    corners.bottomLeft.x, corners.bottomLeft.y,
+    tl.x, tl.y,
+    tr.x, tr.y,
+    br.x, br.y,
+    bl.x, bl.y,
   ]);
 
   var dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
@@ -542,13 +775,24 @@ function perspectiveCorrect(src, corners) {
 }
 
 function orderCorners(points) {
-  var bySum = points.slice().sort(function (a, b) { return (a.x + a.y) - (b.x + b.y); });
-  var topLeft = bySum[0];
-  var bottomRight = bySum[3];
+  // Sort the 4 corners clockwise by angle around their centroid, then rotate the
+  // list to start at the top-left-most point. Robust to document rotation/skew
+  // (the old sum/diff method mislabels corners once the doc is tilted > ~30deg).
+  var cx = 0, cy = 0;
+  for (var i = 0; i < points.length; i++) { cx += points[i].x; cy += points[i].y; }
+  cx /= points.length;
+  cy /= points.length;
 
-  var byDiff = points.slice().sort(function (a, b) { return (a.x - a.y) - (b.x - b.y); });
-  var topRight = byDiff[3];
-  var bottomLeft = byDiff[0];
+  var ordered = points.slice().sort(function (a, b) {
+    return Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx);
+  });
 
-  return { topLeft: topLeft, topRight: topRight, bottomRight: bottomRight, bottomLeft: bottomLeft };
+  var startIdx = 0, minSum = Infinity;
+  for (var j = 0; j < ordered.length; j++) {
+    var s = ordered[j].x + ordered[j].y;
+    if (s < minSum) { minSum = s; startIdx = j; }
+  }
+  var r = ordered.slice(startIdx).concat(ordered.slice(0, startIdx));
+
+  return { topLeft: r[0], topRight: r[1], bottomRight: r[2], bottomLeft: r[3] };
 }

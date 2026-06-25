@@ -5,19 +5,14 @@ import ResultScreen from '@/components/ResultScreen/ResultScreen'
 import { useDocumentDetection, type QuadCorners } from '@/hooks/useDocumentDetection'
 import { imagesToPdf, toBlob } from '@/lib/pdf'
 import { useDocumentStore } from '@/stores/documentStore'
+import { type Filter, type Adjustments, DEFAULT_FILTER, DEFAULT_ADJ } from '@/lib/imageFilters'
+import { filterToCanvas, filterToCanvasSync } from '@/lib/filterClient'
 
 // ================================================================
 // Types
 // ================================================================
 
 type Phase = 'home' | 'camera' | 'crop' | 'review' | 'editPage' | 'processing' | 'done'
-type Filter = 'magicColor' | 'original' | 'grayscale' | 'bw'
-
-interface Adjustments {
-  brightness: number // -60..60
-  contrast: number   // -30..100
-  sharpness: number  // 0..100
-}
 
 interface ScannedPage {
   id: string
@@ -28,225 +23,34 @@ interface ScannedPage {
   thumbnailUrl: string
 }
 
-const DEFAULT_ADJ: Adjustments = { brightness: 0, contrast: 0, sharpness: 50 }
-const DEFAULT_FILTER: Filter = 'magicColor'
-
 // ================================================================
-// Image processing — Magic Color (CamScanner-style per-channel percentile stretching)
+// Image processing — the filter algorithm now lives in src/lib/imageFilters.ts
+// (single source shared by the main thread and the off-thread filter worker,
+// driven via src/lib/filterClient.ts).
 // ================================================================
 
-function processDocumentScan(source: HTMLCanvasElement, filter: Filter, adj: Adjustments): HTMLCanvasElement {
-  const w = source.width, h = source.height
-  const canvas = document.createElement('canvas')
-  canvas.width = w; canvas.height = h
-  const ctx = canvas.getContext('2d')!
-  ctx.drawImage(source, 0, 0)
+const MAX_OUTPUT_DIM = 2400 // cap the long side of the final scan (~290 dpi A4) — TUNE
 
-  if (filter === 'original' && adj.brightness === 0 && adj.contrast === 0 && adj.sharpness === 0) return canvas
-
-  const imageData = ctx.getImageData(0, 0, w, h)
-  const d = imageData.data
-  const totalPixels = w * h
-
-  if (filter === 'magicColor') {
-    // ─── Photocopy Effect (v3) ───
-    // Full histogram per channel
-    const histR = new Uint32Array(256)
-    const histG = new Uint32Array(256)
-    const histB = new Uint32Array(256)
-
-    for (let i = 0; i < totalPixels; i++) {
-      const idx = i * 4
-      histR[d[idx]]++
-      histG[d[idx + 1]]++
-      histB[d[idx + 2]]++
-    }
-
-    function histPercentile(hist: Uint32Array, p: number): number {
-      const target = Math.floor(totalPixels * p)
-      let sum = 0
-      for (let i = 0; i < 256; i++) {
-        sum += hist[i]
-        if (sum >= target) return i
-      }
-      return 255
-    }
-
-    // Aggressive clipping: 2% – 96% (cuts warm shadows + pushes paper to white)
-    const lows  = [histPercentile(histR, 0.02), histPercentile(histG, 0.02), histPercentile(histB, 0.02)]
-    const highs = [histPercentile(histR, 0.96), histPercentile(histG, 0.96), histPercentile(histB, 0.96)]
-
-    const gamma = 0.55          // Strong brightening — paper → white
-    const builtInContrast = 1.4 // Built-in S-curve for text/paper separation
-    const brightOff = adj.brightness / 200
-    const userContPow = adj.contrast !== 0 ? 1 + adj.contrast / 50 : 1
-
-    // Build LUT per channel (256 entries)
-    const luts: Uint8Array[] = []
-    for (let ch = 0; ch < 3; ch++) {
-      const lut = new Uint8Array(256)
-      const lo = lows[ch]
-      const range = Math.max(1, highs[ch] - lo)
-      for (let v = 0; v < 256; v++) {
-        // 1. Percentile stretching
-        let n = Math.max(0, Math.min(1, (v - lo) / range))
-        // 2. Gamma correction (paper → white)
-        n = Math.pow(n, gamma)
-        // 3. Built-in S-curve contrast (always applied for photocopy look)
-        n = n < 0.5
-          ? 0.5 * Math.pow(2 * n, builtInContrast)
-          : 1 - 0.5 * Math.pow(2 * (1 - n), builtInContrast)
-        // 4. White boost — push bright values to pure white
-        if (n > 0.78) {
-          n = 0.78 + (n - 0.78) * 2.2
-          n = Math.min(1, n)
-        }
-        // 5. User brightness
-        n += brightOff
-        n = Math.max(0, Math.min(1, n))
-        // 6. User contrast (on top of built-in)
-        if (userContPow !== 1) {
-          n = n < 0.5
-            ? 0.5 * Math.pow(2 * n, userContPow)
-            : 1 - 0.5 * Math.pow(2 * (1 - n), userContPow)
-        }
-        lut[v] = Math.round(Math.max(0, Math.min(1, n)) * 255)
-      }
-      luts.push(lut)
-    }
-
-    // Apply LUTs in a single pass
-    for (let i = 0; i < totalPixels; i++) {
-      const idx = i * 4
-      d[idx]     = luts[0][d[idx]]
-      d[idx + 1] = luts[1][d[idx + 1]]
-      d[idx + 2] = luts[2][d[idx + 2]]
-    }
-  } else if (filter === 'original') {
-    const brightnessOff = adj.brightness * 0.4
-    const contrastPow = 1 + adj.contrast / 100
-    for (let i = 0; i < d.length; i += 4) {
-      for (let c = 0; c < 3; c++) {
-        let v = d[i + c] + brightnessOff
-        v = Math.max(0, Math.min(1, v / 255))
-        if (contrastPow !== 1) {
-          v = v < 0.5
-            ? 0.5 * Math.pow(2 * v, contrastPow)
-            : 1 - 0.5 * Math.pow(2 * (1 - v), contrastPow)
-        }
-        d[i + c] = Math.round(v * 255)
-      }
-    }
-  } else if (filter === 'grayscale') {
-    const step = Math.max(1, Math.floor(totalPixels / 5000)) * 4
-    const samples: number[] = []
-    for (let i = 0; i < d.length; i += step) {
-      samples.push(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2])
-    }
-    samples.sort((a, b) => a - b)
-    const pLow = samples[Math.floor(samples.length * 0.03)] ?? 0
-    const pHigh = samples[Math.floor(samples.length * 0.97)] ?? 255
-    const range = Math.max(1, pHigh - pLow)
-
-    for (let i = 0; i < d.length; i += 4) {
-      let gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]
-      gray = ((gray - pLow) / range) * 255 + adj.brightness * 0.4
-      gray = Math.max(0, Math.min(255, gray))
-      d[i] = d[i + 1] = d[i + 2] = Math.round(gray)
-    }
-  } else if (filter === 'bw') {
-    // Otsu adaptive thresholding
-    const histogram = new Array(256).fill(0)
-    for (let i = 0; i < d.length; i += 4) {
-      const gray = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2])
-      histogram[gray]++
-    }
-
-    let sumAll = 0
-    for (let t = 0; t < 256; t++) sumAll += t * histogram[t]
-
-    let sumB = 0, wB = 0, maxVariance = 0, bestThreshold = 128
-
-    for (let t = 0; t < 256; t++) {
-      wB += histogram[t]
-      if (wB === 0) continue
-      const wF = totalPixels - wB
-      if (wF === 0) break
-
-      sumB += t * histogram[t]
-      const meanB = sumB / wB
-      const meanF = (sumAll - sumB) / wF
-      const variance = wB * wF * (meanB - meanF) * (meanB - meanF)
-
-      if (variance > maxVariance) {
-        maxVariance = variance
-        bestThreshold = t
-      }
-    }
-
-    const threshAdj = bestThreshold - adj.brightness * 0.5
-    for (let i = 0; i < d.length; i += 4) {
-      const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]
-      const val = gray > threshAdj ? 255 : 0
-      d[i] = d[i + 1] = d[i + 2] = val
-    }
-  }
-
-  ctx.putImageData(imageData, 0, 0)
-  if (adj.sharpness > 0) sharpenCanvas(canvas, adj.sharpness / 100)
-
-  return canvas
+/** Downscale before filtering so the pixel pass is cheaper and the file smaller. */
+function downscaleForOutput(canvas: HTMLCanvasElement): HTMLCanvasElement {
+  const long = Math.max(canvas.width, canvas.height)
+  if (long <= MAX_OUTPUT_DIM) return canvas
+  const s = MAX_OUTPUT_DIM / long
+  const c = document.createElement('canvas')
+  c.width = Math.round(canvas.width * s)
+  c.height = Math.round(canvas.height * s)
+  c.getContext('2d', { willReadFrequently: true })!.drawImage(canvas, 0, 0, c.width, c.height)
+  return c
 }
 
-function sharpenCanvas(canvas: HTMLCanvasElement, amount: number) {
-  if (amount <= 0) return
-  const w = canvas.width, h = canvas.height
-  const ctx = canvas.getContext('2d')!
-  const original = ctx.getImageData(0, 0, w, h)
-
-  const blurCanvas = document.createElement('canvas')
-  blurCanvas.width = w; blurCanvas.height = h
-  const blurCtx = blurCanvas.getContext('2d')!
-  try { blurCtx.filter = 'blur(1px)' } catch { return }
-  blurCtx.drawImage(canvas, 0, 0)
-  const blurred = blurCtx.getImageData(0, 0, w, h)
-
-  const strength = amount * 2
-  const od = original.data, bd = blurred.data
-  for (let i = 0; i < od.length; i += 4) {
-    for (let c = 0; c < 3; c++) {
-      od[i + c] = Math.max(0, Math.min(255, od[i + c] + Math.round((od[i + c] - bd[i + c]) * strength)))
-    }
-  }
-  ctx.putImageData(original, 0, 0)
-}
-
-function processAndCreateFile(raw: HTMLCanvasElement, filter: Filter, adj: Adjustments): Promise<{ file: File; url: string }> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('Processing timeout')), 5000)
-    try {
-      const processed = processDocumentScan(raw, filter, adj)
-      processed.toBlob((blob) => {
-        clearTimeout(timeout)
-        if (!blob) { reject(new Error('Blob creation failed')); return }
-        const file = new File([blob], `scan_${Date.now()}.jpg`, { type: 'image/jpeg' })
-        resolve({ file, url: URL.createObjectURL(blob) })
-      }, 'image/jpeg', 0.92)
-    } catch (err) {
-      clearTimeout(timeout)
-      reject(err)
-    }
+async function processAndCreateFile(raw: HTMLCanvasElement, filter: Filter, adj: Adjustments): Promise<{ file: File; url: string }> {
+  // Heavy pixel pass runs off the main thread (filterToCanvas), with a sync fallback.
+  const processed = await filterToCanvas(downscaleForOutput(raw), filter, adj)
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    processed.toBlob((b) => (b ? resolve(b) : reject(new Error('Blob creation failed'))), 'image/jpeg', 0.92)
   })
-}
-
-function canvasToFileSync(canvas: HTMLCanvasElement, quality = 0.92): { file: File; thumbnailUrl: string } {
-  const dataUrl = canvas.toDataURL('image/jpeg', quality)
-  const parts = dataUrl.split(',')
-  const byteStr = atob(parts[1])
-  const arr = new Uint8Array(byteStr.length)
-  for (let i = 0; i < byteStr.length; i++) arr[i] = byteStr.charCodeAt(i)
-  const file = new File([arr], `scan_${Date.now()}.jpg`, { type: 'image/jpeg' })
-  return { file, thumbnailUrl: dataUrl }
+  const file = new File([blob], `scan_${Date.now()}.jpg`, { type: 'image/jpeg' })
+  return { file, url: URL.createObjectURL(blob) }
 }
 
 // ================================================================
@@ -269,6 +73,86 @@ function SliderRow({ icon, label, value, min, max, onChange }: {
       <span className="w-8 text-right text-[10px] text-white/50">{value}</span>
     </div>
   )
+}
+
+// ================================================================
+// Camera helpers (robust acquisition, focus, torch, quad stability)
+// ================================================================
+
+// Auto-capture tuning — adjust on a real device.
+const AUTO_STABLE_THRESHOLD = 0.025 // max normalized corner movement to count as "stable"
+const AUTO_FRAMES_SHARP = 2         // stable detections before auto-capture when sharp + framed
+const AUTO_FRAMES_BLUR = 5          // ...more when blurry (soft gate — never fully blocks)
+const SHARPNESS_MIN = 40            // min Laplacian variance to treat the frame as sharp
+const FRAMING_EDGE = 0.015          // corners must sit inside this margin (else doc is clipped)
+const FRAMING_AREA_MIN = 0.12       // quad must cover at least this fraction of the frame
+const FRAMING_AREA_MAX = 0.98
+
+function quadMaxDelta(a: QuadCorners, b: QuadCorners): number {
+  const pairs: Array<[{ x: number; y: number }, { x: number; y: number }]> = [
+    [a.topLeft, b.topLeft], [a.topRight, b.topRight],
+    [a.bottomRight, b.bottomRight], [a.bottomLeft, b.bottomLeft],
+  ]
+  let max = 0
+  for (const [p, q] of pairs) {
+    const d = Math.hypot(p.x - q.x, p.y - q.y)
+    if (d > max) max = d
+  }
+  return max
+}
+
+function quadArea(q: QuadCorners): number {
+  const pts = [q.topLeft, q.topRight, q.bottomRight, q.bottomLeft]
+  let a = 0
+  for (let i = 0; i < 4; i++) {
+    const p = pts[i], n = pts[(i + 1) % 4]
+    a += p.x * n.y - n.x * p.y
+  }
+  return Math.abs(a) / 2
+}
+
+/** The document is fully in frame (no clipped corner) and covers a sane area. */
+function isWellFramed(q: QuadCorners): boolean {
+  const xs = [q.topLeft.x, q.topRight.x, q.bottomRight.x, q.bottomLeft.x]
+  const ys = [q.topLeft.y, q.topRight.y, q.bottomRight.y, q.bottomLeft.y]
+  const inside =
+    Math.min(...xs) > FRAMING_EDGE && Math.max(...xs) < 1 - FRAMING_EDGE &&
+    Math.min(...ys) > FRAMING_EDGE && Math.max(...ys) < 1 - FRAMING_EDGE
+  const area = quadArea(q)
+  return inside && area > FRAMING_AREA_MIN && area < FRAMING_AREA_MAX
+}
+
+/** Try progressively looser constraints so the camera opens on the widest range of devices. */
+function requestCameraStream(): Promise<MediaStream> {
+  const attempts: MediaStreamConstraints[] = [
+    { video: { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 1920 } } },
+    { video: { facingMode: 'environment' } },
+    { video: true },
+  ]
+  return (async () => {
+    let lastErr: unknown
+    for (const constraints of attempts) {
+      try {
+        return await navigator.mediaDevices.getUserMedia(constraints)
+      } catch (err) {
+        lastErr = err
+      }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error('getUserMedia failed')
+  })()
+}
+
+type AdvancedConstraint = MediaTrackConstraintSet & { torch?: boolean; focusMode?: string }
+
+/** Best-effort continuous autofocus + torch-capability detection (both unsupported on many devices). */
+function applyCameraEnhancements(stream: MediaStream, onTorch: (supported: boolean) => void) {
+  const track = stream.getVideoTracks()[0]
+  if (!track) { onTorch(false); return }
+  const caps = (track.getCapabilities?.() ?? {}) as MediaTrackCapabilities & { torch?: boolean; focusMode?: string[] }
+  if (caps.focusMode?.includes('continuous')) {
+    track.applyConstraints({ advanced: [{ focusMode: 'continuous' } as AdvancedConstraint] }).catch(() => {})
+  }
+  onTorch(!!caps.torch)
 }
 
 // ================================================================
@@ -297,6 +181,18 @@ export default function Scanner() {
   const [cameraError, setCameraError] = useState<string | null>(null)
   const [cameraSuccess, setCameraSuccess] = useState<string | null>(null)
   const [showFlash, setShowFlash] = useState(false)
+  const [isCapturing, setIsCapturing] = useState(false)
+  const capturingRef = useRef(false)
+  const [torchOn, setTorchOn] = useState(false)
+  const [torchSupported, setTorchSupported] = useState(false)
+  const [autoCapture, setAutoCapture] = useState(true)
+  const [autoCountdown, setAutoCountdown] = useState<number | null>(null)
+  const [autoFeedback, setAutoFeedback] = useState<'adjust' | 'blur' | null>(null)
+  const [scanMode, setScanMode] = useState<'batch' | 'single'>('batch')
+  const stableFramesRef = useRef(0)
+  const lastStableQuadRef = useRef<QuadCorners | null>(null)
+  const autoArmedRef = useRef(true)
+  const capturePhotoRef = useRef<() => void>(() => {})
 
   // Crop phase state
   const [cropCanvas, setCropCanvas] = useState<HTMLCanvasElement | null>(null)
@@ -310,7 +206,7 @@ export default function Scanner() {
   const [editAdj, setEditAdj] = useState<Adjustments>(DEFAULT_ADJ)
   const [editPreviewUrl, setEditPreviewUrl] = useState('')
 
-  const { cvReady, liveQuad, cropCanvasWithCorners, startLiveDetection, stopLiveDetection } = useDocumentDetection({
+  const { cvReady, liveQuad, sharpnessRef, detectCorners, cropCanvasWithCorners, startLiveDetection, stopLiveDetection } = useDocumentDetection({
     enabled: phase === 'camera' || phase === 'crop',
   })
 
@@ -333,6 +229,60 @@ export default function Scanner() {
     }
   }, [phase, cvReady, startLiveDetection, stopLiveDetection])
 
+  // Keep a stable ref to the latest capturePhoto so the auto-capture effect can call
+  // it without re-running every render (no deps array → updates on every render).
+  useEffect(() => { capturePhotoRef.current = capturePhoto })
+
+  // Auto-capture: fire once the detected quad has held still for a few cycles.
+  // Re-arms only after the document leaves the frame, so a still document isn't
+  // captured repeatedly — mirrors CamScanner's batch auto-shutter.
+  useEffect(() => {
+    if (phase !== 'camera' || !autoCapture || isCapturing) {
+      stableFramesRef.current = 0
+      setAutoCountdown(null)
+      setAutoFeedback(null)
+      return
+    }
+    if (!liveQuad) {
+      stableFramesRef.current = 0
+      lastStableQuadRef.current = null
+      autoArmedRef.current = true
+      setAutoCountdown(null)
+      setAutoFeedback(null)
+      return
+    }
+    if (!autoArmedRef.current) return
+
+    // Quality gate 1 (hard): never auto-capture a clipped / badly framed document.
+    if (!isWellFramed(liveQuad)) {
+      stableFramesRef.current = 0
+      lastStableQuadRef.current = liveQuad
+      setAutoCountdown(null)
+      setAutoFeedback('adjust')
+      return
+    }
+
+    const prev = lastStableQuadRef.current
+    const moved = prev ? quadMaxDelta(prev, liveQuad) : 1
+    lastStableQuadRef.current = liveQuad
+    stableFramesRef.current = moved < AUTO_STABLE_THRESHOLD ? stableFramesRef.current + 1 : 1
+
+    // Quality gate 2 (soft): blurry frames just need to hold still a bit longer.
+    const sharp = sharpnessRef.current >= SHARPNESS_MIN
+    const needed = sharp ? AUTO_FRAMES_SHARP : AUTO_FRAMES_BLUR
+    setAutoFeedback(sharp ? null : 'blur')
+
+    if (stableFramesRef.current >= needed) {
+      autoArmedRef.current = false
+      stableFramesRef.current = 0
+      setAutoCountdown(null)
+      setAutoFeedback(null)
+      capturePhotoRef.current()
+    } else {
+      setAutoCountdown(needed - stableFramesRef.current)
+    }
+  }, [liveQuad, autoCapture, isCapturing, phase, sharpnessRef])
+
   // Draw overlay on live video showing detected quad
   useEffect(() => {
     if (phase !== 'camera') return
@@ -349,13 +299,29 @@ export default function Scanner() {
     const ctx = overlayCanvas.getContext('2d')!
     ctx.clearRect(0, 0, cW, cH)
 
-    if (!liveQuad) return
+    const video = videoRef.current
+    if (!liveQuad || !video) return
+
+    const vw = video.videoWidth
+    const vh = video.videoHeight
+    if (vw === 0 || vh === 0) return
+
+    // The <video> renders with object-cover: scaled by max(cW/vw, cH/vh) and
+    // center-cropped. The quad is normalized to the video frame, so map it through
+    // the SAME transform — otherwise the green frame drifts off the real edges.
+    const scale = Math.max(cW / vw, cH / vh)
+    const dispW = vw * scale
+    const dispH = vh * scale
+    const offsetX = (cW - dispW) / 2
+    const offsetY = (cH - dispH) / 2
+    const mapX = (nx: number) => offsetX + nx * dispW
+    const mapY = (ny: number) => offsetY + ny * dispH
 
     const pts = [
-      { x: liveQuad.topLeft.x * cW, y: liveQuad.topLeft.y * cH },
-      { x: liveQuad.topRight.x * cW, y: liveQuad.topRight.y * cH },
-      { x: liveQuad.bottomRight.x * cW, y: liveQuad.bottomRight.y * cH },
-      { x: liveQuad.bottomLeft.x * cW, y: liveQuad.bottomLeft.y * cH },
+      { x: mapX(liveQuad.topLeft.x), y: mapY(liveQuad.topLeft.y) },
+      { x: mapX(liveQuad.topRight.x), y: mapY(liveQuad.topRight.y) },
+      { x: mapX(liveQuad.bottomRight.x), y: mapY(liveQuad.bottomRight.y) },
+      { x: mapX(liveQuad.bottomLeft.x), y: mapY(liveQuad.bottomLeft.y) },
     ]
 
     // Semi-transparent fill
@@ -405,7 +371,7 @@ export default function Scanner() {
 
   useEffect(() => {
     if (phase !== 'editPage' || !editPreviewCanvas) return
-    const processed = processDocumentScan(editPreviewCanvas, editFilter, editAdj)
+    const processed = filterToCanvasSync(editPreviewCanvas, editFilter, editAdj)
     setEditPreviewUrl(processed.toDataURL('image/jpeg', 0.85))
   }, [phase, editPreviewCanvas, editFilter, editAdj])
 
@@ -422,9 +388,7 @@ export default function Scanner() {
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 2560 }, height: { ideal: 1920 } },
-      })
+      const stream = await requestCameraStream()
       streamRef.current = stream
       setPhase('camera')
 
@@ -458,6 +422,7 @@ export default function Scanner() {
       }
 
       await attachStream()
+      applyCameraEnhancements(stream, setTorchSupported)
     } catch {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((tr) => tr.stop())
@@ -483,24 +448,41 @@ export default function Scanner() {
     }
     streamRef.current?.getTracks().forEach((tr) => tr.stop())
     streamRef.current = null
+    setTorchOn(false)
+    setTorchSupported(false)
+  }
+
+  async function toggleTorch() {
+    const track = streamRef.current?.getVideoTracks()[0]
+    if (!track) return
+    const next = !torchOn
+    try {
+      await track.applyConstraints({ advanced: [{ torch: next } as AdvancedConstraint] })
+      setTorchOn(next)
+    } catch { /* torch unsupported on this device */ }
   }
 
   // ---- Capture ----
   async function capturePhoto() {
-    setShowFlash(true)
-    setTimeout(() => setShowFlash(false), 200)
+    // Guard against double-capture: ignore taps while a capture is in flight.
+    if (capturingRef.current) return
 
     const video = videoRef.current
-    if (!video) {
+    if (!video || video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) {
       setCameraError('Camera not ready')
       setTimeout(() => setCameraError(null), 3000)
       return
     }
 
+    capturingRef.current = true
+    setIsCapturing(true)
+    if (navigator.vibrate) navigator.vibrate(40) // haptic shutter feedback
+    setShowFlash(true)
+    setTimeout(() => setShowFlash(false), 200)
+
     try {
       const vw = video.videoWidth
       const vh = video.videoHeight
-      if (vw === 0 || vh === 0) return
 
       // Capture full-res frame
       const fullCanvas = document.createElement('canvas')
@@ -509,20 +491,23 @@ export default function Scanner() {
       fullCanvas.getContext('2d')!.drawImage(video, 0, 0)
 
       if (liveQuad) {
-        // Auto-crop using the detected quad
+        // Auto-crop. Refine the live (480p) quad on the full-res frame for sharper
+        // corners; fall back to the live quad if the one-shot detection fails.
         stopLiveDetection()
+        const refined = await detectCorners(fullCanvas)
+        const quad = refined ?? liveQuad
         const pixelCorners: QuadCorners = {
-          topLeft: { x: liveQuad.topLeft.x * vw, y: liveQuad.topLeft.y * vh },
-          topRight: { x: liveQuad.topRight.x * vw, y: liveQuad.topRight.y * vh },
-          bottomRight: { x: liveQuad.bottomRight.x * vw, y: liveQuad.bottomRight.y * vh },
-          bottomLeft: { x: liveQuad.bottomLeft.x * vw, y: liveQuad.bottomLeft.y * vh },
+          topLeft: { x: quad.topLeft.x * vw, y: quad.topLeft.y * vh },
+          topRight: { x: quad.topRight.x * vw, y: quad.topRight.y * vh },
+          bottomRight: { x: quad.bottomRight.x * vw, y: quad.bottomRight.y * vh },
+          bottomLeft: { x: quad.bottomLeft.x * vw, y: quad.bottomLeft.y * vh },
         }
 
         const result = await cropCanvasWithCorners(fullCanvas, pixelCorners)
         const rawCanvas = result.canvas ?? fullCanvas
 
-        const processed = processDocumentScan(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
-        const { file, thumbnailUrl } = canvasToFileSync(processed)
+        // Async encode (toBlob) — avoids the blocking toDataURL+atob path.
+        const { file, url: thumbnailUrl } = await processAndCreateFile(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
         const id = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
 
         setPages((prev) => [...prev, { id, rawCanvas, filter: DEFAULT_FILTER, adjustments: { ...DEFAULT_ADJ }, processedFile: file, thumbnailUrl }])
@@ -530,8 +515,14 @@ export default function Scanner() {
         setCameraSuccess(t('scanner.documentDetected'))
         setTimeout(() => setCameraSuccess(null), 2000)
 
-        // Restart live detection for next page
-        startLiveDetection(videoRef)
+        if (scanMode === 'single') {
+          // Single mode: one page, then straight to review.
+          stopCamera()
+          setPhase('review')
+        } else {
+          // Batch mode: keep scanning the next page.
+          startLiveDetection(videoRef)
+        }
       } else {
         // No quad detected — go to manual crop
         stopCamera()
@@ -547,6 +538,9 @@ export default function Scanner() {
     } catch (err) {
       setCameraError(err instanceof Error ? err.message : t('scanner.cameraError'))
       setTimeout(() => setCameraError(null), 5000)
+    } finally {
+      capturingRef.current = false
+      setIsCapturing(false)
     }
   }
 
@@ -569,7 +563,7 @@ export default function Scanner() {
       bottomLeft: { x: cropCorners.bottomLeft.x * w, y: cropCorners.bottomLeft.y * h },
     }
 
-    cropCanvasWithCorners(cropCanvas, pixelCorners).then((result) => {
+    cropCanvasWithCorners(cropCanvas, pixelCorners).then(async (result) => {
       const rawCanvas = result.canvas ?? cropCanvas
 
       if (recropPageId) {
@@ -577,8 +571,8 @@ export default function Scanner() {
         const currentPage = pages.find((p) => p.id === recropPageId)
         const filter = currentPage?.filter ?? editFilter
         const adjustments = currentPage?.adjustments ?? editAdj
-        const processed = processDocumentScan(rawCanvas, filter, adjustments)
-        const { file, thumbnailUrl } = canvasToFileSync(processed)
+        const { file, url: thumbnailUrl } = await processAndCreateFile(rawCanvas, filter, adjustments)
+        if (currentPage) URL.revokeObjectURL(currentPage.thumbnailUrl)
 
         setPages((prev) => prev.map((p) =>
           p.id === recropPageId
@@ -591,8 +585,7 @@ export default function Scanner() {
         setPhase('editPage')
       } else {
         // New page
-        const processed = processDocumentScan(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
-        const { file, thumbnailUrl } = canvasToFileSync(processed)
+        const { file, url: thumbnailUrl } = await processAndCreateFile(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
         const id = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
 
         setPages((prev) => [...prev, { id, rawCanvas, filter: DEFAULT_FILTER, adjustments: { ...DEFAULT_ADJ }, processedFile: file, thumbnailUrl }])
@@ -739,7 +732,7 @@ export default function Scanner() {
       setResultBlob(blob)
 
       const fileName = `scan_${new Date().toISOString().slice(0, 10)}.pdf`
-      addDocument({ id: `doc_${Date.now()}`, title: fileName, type: 'scan', size: blob.size, createdAt: new Date().toISOString(), blobUrl: URL.createObjectURL(blob) })
+      addDocument({ id: `doc_${Date.now()}`, title: fileName, type: 'scan', size: blob.size, createdAt: new Date().toISOString() }, blob)
       setPhase('done')
     } catch (err) {
       setProcessError(err instanceof Error ? err.message : 'Processing failed')
@@ -896,6 +889,23 @@ export default function Scanner() {
             </div>
           )}
 
+          <div className="absolute right-3 top-3 z-20 flex flex-col gap-2">
+            <button onClick={() => setScanMode((m) => (m === 'batch' ? 'single' : 'batch'))} aria-label={t('scanner.scanMode')}
+              className="flex h-10 w-10 items-center justify-center rounded-full bg-black/50 text-white/80 shadow-lg">
+              <span className="material-symbols-outlined text-xl">{scanMode === 'batch' ? 'burst_mode' : 'looks_one'}</span>
+            </button>
+            <button onClick={() => setAutoCapture((v) => !v)} aria-label={t('scanner.autoCapture')}
+              className={`flex h-10 w-10 items-center justify-center rounded-full shadow-lg ${autoCapture ? 'bg-primary text-white' : 'bg-black/50 text-white/80'}`}>
+              <span className="material-symbols-outlined text-xl">{autoCapture ? 'motion_photos_on' : 'motion_photos_off'}</span>
+            </button>
+            {torchSupported && (
+              <button onClick={toggleTorch} aria-label={t('scanner.torch')}
+                className={`flex h-10 w-10 items-center justify-center rounded-full shadow-lg ${torchOn ? 'bg-yellow-400 text-black' : 'bg-black/50 text-white/80'}`}>
+                <span className="material-symbols-outlined text-xl">{torchOn ? 'flashlight_on' : 'flashlight_off'}</span>
+              </button>
+            )}
+          </div>
+
           {cameraError && (
             <div className="absolute left-3 right-3 top-14 z-30 rounded-lg bg-red-600/90 px-4 py-2.5 text-center text-sm font-medium text-white shadow-lg">{cameraError}</div>
           )}
@@ -908,8 +918,17 @@ export default function Scanner() {
           )}
 
           <div className="absolute bottom-3 left-0 right-0 z-20 text-center">
-            <span className={`rounded-full px-4 py-1.5 text-xs font-medium ${liveQuad ? 'bg-green-600/80 text-white' : 'bg-black/50 text-white/90'}`}>
-              {liveQuad ? t('scanner.documentDetected') : cvReady ? t('scanner.autoDetectReady') : t('scanner.alignDocument')}
+            <span className={`rounded-full px-4 py-1.5 text-xs font-medium ${
+              autoFeedback ? 'bg-amber-500/85 text-white'
+                : liveQuad ? 'bg-green-600/80 text-white'
+                : 'bg-black/50 text-white/90'
+            }`}>
+              {autoFeedback === 'adjust' ? t('scanner.adjustFraming')
+                : autoFeedback === 'blur' ? t('scanner.tooBlurry')
+                : autoCapture && autoCountdown !== null && liveQuad ? t('scanner.autoCapturing')
+                : liveQuad ? t('scanner.documentDetected')
+                : cvReady ? t('scanner.autoDetectReady')
+                : t('scanner.alignDocument')}
             </span>
           </div>
         </div>
@@ -929,8 +948,8 @@ export default function Scanner() {
           <button onClick={() => { stopCamera(); setPhase(pages.length > 0 ? 'review' : 'home') }} className="min-w-[64px] rounded-lg px-2 py-2 text-sm font-medium text-white/80">
             {t('common.cancel')}
           </button>
-          <button onClick={capturePhoto}
-            className={`flex h-[72px] w-[72px] items-center justify-center rounded-full border-[4px] shadow-lg transition-transform active:scale-90 ${liveQuad ? 'border-green-400' : 'border-white'}`}>
+          <button onClick={capturePhoto} disabled={isCapturing} aria-label={t('scanner.capture')}
+            className={`flex h-[72px] w-[72px] items-center justify-center rounded-full border-[4px] shadow-lg transition-transform active:scale-90 disabled:opacity-50 ${liveQuad ? 'border-green-400' : 'border-white'}`}>
             <div className={`pointer-events-none h-[56px] w-[56px] rounded-full ${liveQuad ? 'bg-green-400' : 'bg-white'}`} />
           </button>
           {pages.length > 0 ? (
