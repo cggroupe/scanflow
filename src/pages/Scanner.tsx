@@ -151,13 +151,12 @@ export default function Scanner() {
   const addDocument = useDocumentStore((s) => s.addDocument)
   const setPendingFile = useDocumentStore((s) => s.setPendingFile)
 
-  const [searchParams] = useSearchParams()
+  const [searchParams, setSearchParams] = useSearchParams()
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const videoContainerRef = useRef<HTMLDivElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const importRef = useRef<HTMLInputElement | null>(null)
-  const autoOpenDone = useRef(false)
 
   const [phase, setPhase] = useState<Phase>('home')
   const [pages, setPages] = useState<ScannedPage[]>([])
@@ -359,11 +358,13 @@ export default function Scanner() {
   }, [t, pages])
 
   useEffect(() => {
-    if (!autoOpenDone.current && searchParams.get('mode') === 'camera' && phase === 'home') {
-      autoOpenDone.current = true
+    // Open the camera whenever something navigates to /scanner?mode=camera (the FAB,
+    // home buttons, etc.) — from ANY phase, not just home — then consume the param.
+    if (searchParams.get('mode') === 'camera' && phase !== 'camera' && phase !== 'crop') {
+      setSearchParams({}, { replace: true })
       openCamera()
     }
-  }, [searchParams, phase, openCamera])
+  }, [searchParams, phase, openCamera, setSearchParams])
 
   function stopCamera() {
     stopLiveDetection()

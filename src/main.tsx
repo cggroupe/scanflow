@@ -10,10 +10,8 @@ createRoot(document.getElementById('root')!).render(
   </StrictMode>,
 )
 
-// Register the service worker for offline support (production only, to avoid
-// caching headaches during local dev).
-if (import.meta.env.PROD && 'serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(() => {})
-  })
-}
+// NOTE: the service worker is intentionally NOT registered anymore. A previous
+// cache-first SW kept serving stale builds during iteration. public/sw.js is now a
+// self-destruct worker (clears caches + unregisters) so any client that still has
+// the old SW recovers to a fresh, network-loaded app. A clean SW can be re-added
+// later once the app stabilizes.
