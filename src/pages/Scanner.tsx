@@ -189,6 +189,7 @@ export default function Scanner() {
   const [autoCountdown, setAutoCountdown] = useState<number | null>(null)
   const [autoFeedback, setAutoFeedback] = useState<'adjust' | 'blur' | null>(null)
   const [scanMode, setScanMode] = useState<'batch' | 'single'>('batch')
+  const [previewPageId, setPreviewPageId] = useState<string | null>(null)
   const stableFramesRef = useRef(0)
   const lastStableQuadRef = useRef<QuadCorners | null>(null)
   const autoArmedRef = useRef(true)
@@ -206,7 +207,7 @@ export default function Scanner() {
   const [editAdj, setEditAdj] = useState<Adjustments>(DEFAULT_ADJ)
   const [editPreviewUrl, setEditPreviewUrl] = useState('')
 
-  const { cvReady, liveQuad, sharpnessRef, detectCorners, cropCanvasWithCorners, startLiveDetection, stopLiveDetection } = useDocumentDetection({
+  const { cvReady, liveQuad, sharpnessRef, cropCanvasWithCorners, startLiveDetection, stopLiveDetection } = useDocumentDetection({
     enabled: phase === 'camera' || phase === 'crop',
   })
 
@@ -491,11 +492,10 @@ export default function Scanner() {
       fullCanvas.getContext('2d')!.drawImage(video, 0, 0)
 
       if (liveQuad) {
-        // Auto-crop. Refine the live (480p) quad on the full-res frame for sharper
-        // corners; fall back to the live quad if the one-shot detection fails.
+        // Auto-crop using the tracked live quad directly (Engine v2 already smooths
+        // and tracks it). Skipping a full-res re-detect here keeps the shutter snappy.
         stopLiveDetection()
-        const refined = await detectCorners(fullCanvas)
-        const quad = refined ?? liveQuad
+        const quad = liveQuad
         const pixelCorners: QuadCorners = {
           topLeft: { x: quad.topLeft.x * vw, y: quad.topLeft.y * vh },
           topRight: { x: quad.topRight.x * vw, y: quad.topRight.y * vh },
@@ -936,10 +936,11 @@ export default function Scanner() {
         {pages.length > 0 && (
           <div className="flex items-center gap-2 overflow-x-auto bg-black/90 px-3 py-2">
             {pages.map((page, i) => (
-              <div key={page.id} className="relative flex-shrink-0">
+              <button key={page.id} onClick={() => setPreviewPageId(page.id)} aria-label={`Aperçu page ${i + 1}`}
+                className="relative flex-shrink-0 transition-transform active:scale-95">
                 <img src={page.thumbnailUrl} alt="" className="h-14 w-auto rounded border border-white/30 object-cover" />
                 <span className="absolute -bottom-0.5 -right-0.5 flex h-4 w-4 items-center justify-center rounded-full bg-primary text-[9px] font-bold text-white">{i + 1}</span>
-              </div>
+              </button>
             ))}
           </div>
         )}
@@ -948,8 +949,8 @@ export default function Scanner() {
           <button onClick={() => { stopCamera(); setPhase(pages.length > 0 ? 'review' : 'home') }} className="min-w-[64px] rounded-lg px-2 py-2 text-sm font-medium text-white/80">
             {t('common.cancel')}
           </button>
-          <button onClick={capturePhoto} disabled={isCapturing} aria-label={t('scanner.capture')}
-            className={`flex h-[72px] w-[72px] items-center justify-center rounded-full border-[4px] shadow-lg transition-transform active:scale-90 disabled:opacity-50 ${liveQuad ? 'border-green-400' : 'border-white'}`}>
+          <button onClick={capturePhoto} aria-label={t('scanner.capture')}
+            className={`flex h-[72px] w-[72px] items-center justify-center rounded-full border-[4px] shadow-lg transition-transform active:scale-90 ${liveQuad ? 'border-green-400' : 'border-white'}`}>
             <div className={`pointer-events-none h-[56px] w-[56px] rounded-full ${liveQuad ? 'bg-green-400' : 'bg-white'}`} />
           </button>
           {pages.length > 0 ? (
@@ -960,6 +961,28 @@ export default function Scanner() {
             <div className="min-w-[64px]" />
           )}
         </div>
+
+        {previewPageId && (() => {
+          const p = pages.find((pp) => pp.id === previewPageId)
+          if (!p) return null
+          return (
+            <div className="absolute inset-0 z-[60] flex flex-col bg-black/95" onClick={() => setPreviewPageId(null)}>
+              <div className="flex items-center justify-between px-4 pt-6 pb-3" onClick={(e) => e.stopPropagation()}>
+                <button onClick={() => setPreviewPageId(null)} aria-label={t('common.close')}
+                  className="flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white">
+                  <span className="material-symbols-outlined">close</span>
+                </button>
+                <button onClick={() => { removePage(p.id); setPreviewPageId(null) }} aria-label={t('viewer.delete')}
+                  className="flex h-10 w-10 items-center justify-center rounded-full bg-red-500/80 text-white">
+                  <span className="material-symbols-outlined">delete</span>
+                </button>
+              </div>
+              <div className="flex flex-1 items-center justify-center p-4">
+                <img src={p.thumbnailUrl} alt="" className="max-h-full max-w-full rounded-lg shadow-2xl" />
+              </div>
+            </div>
+          )
+        })()}
       </div>
     )
   }
