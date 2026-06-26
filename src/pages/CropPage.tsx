@@ -4,12 +4,14 @@ import { Link, useNavigate } from 'react-router-dom'
 import FileUploader from '@/components/FileUploader/FileUploader'
 import ResultScreen from '@/components/ResultScreen/ResultScreen'
 import { renderPdfPage, getPdfPageSizes, cropPdf, toBlob } from '@/lib/pdf'
+import { useDocumentStore } from '@/stores/documentStore'
 
 type Phase = 'upload' | 'crop' | 'processing' | 'done' | 'error'
 
 export default function CropPage() {
   const { t } = useTranslation()
   const navigate = useNavigate()
+  const addDocument = useDocumentStore((s) => s.addDocument)
   const canvasRef = useRef<HTMLCanvasElement>(null)
 
   const [files, setFiles] = useState<File[]>([])
@@ -132,7 +134,9 @@ export default function CropPage() {
         height: (crop.bottom - crop.top) * size.height,
       }
       const bytes = await cropPdf(files[0], rect)
-      setResultBlob(toBlob(bytes))
+      const blob = toBlob(bytes)
+      setResultBlob(blob)
+      addDocument({ id: `doc_${Date.now()}`, title: 'cropped.pdf', type: 'pdf', size: blob.size, createdAt: new Date().toISOString() }, blob)
       setPhase('done')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error')

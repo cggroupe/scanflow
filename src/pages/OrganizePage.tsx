@@ -4,12 +4,14 @@ import { Link, useNavigate } from 'react-router-dom'
 import FileUploader from '@/components/FileUploader/FileUploader'
 import ResultScreen from '@/components/ResultScreen/ResultScreen'
 import { getPdfPageCount, reorderPages, toBlob } from '@/lib/pdf'
+import { useDocumentStore } from '@/stores/documentStore'
 
 type Phase = 'upload' | 'organizing' | 'processing' | 'done' | 'error'
 
 export default function OrganizePage() {
   const { t } = useTranslation()
   const navigate = useNavigate()
+  const addDocument = useDocumentStore((s) => s.addDocument)
 
   const [files, setFiles] = useState<File[]>([])
   const [phase, setPhase] = useState<Phase>('upload')
@@ -82,7 +84,9 @@ export default function OrganizePage() {
     setError(null)
     try {
       const bytes = await reorderPages(files[0], pageOrder)
-      setResultBlob(toBlob(bytes))
+      const blob = toBlob(bytes)
+      setResultBlob(blob)
+      addDocument({ id: `doc_${Date.now()}`, title: 'organized.pdf', type: 'pdf', size: blob.size, createdAt: new Date().toISOString() }, blob)
       setPhase('done')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error')

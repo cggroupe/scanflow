@@ -3,8 +3,11 @@ import { useTranslation } from 'react-i18next'
 import { Link, useNavigate } from 'react-router-dom'
 import { useAppStore } from '@/stores/appStore'
 import { useDocumentStore, formatFileSize, formatRelativeDate, type StoredDocument } from '@/stores/documentStore'
+import { getBlob } from '@/lib/blobStore'
 
 const filters = ['all', 'scanned', 'imported', 'pdfs'] as const
+const sortModes = ['date', 'name', 'size'] as const
+type SortMode = (typeof sortModes)[number]
 
 function badgeColor(type: string) {
   if (type === 'pdf' || type === 'scan') return 'bg-red-500'
@@ -41,36 +44,49 @@ export default function Documents() {
   const [newFolderName, setNewFolderName] = useState('')
   const [renamingFolderId, setRenamingFolderId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  const [sortMode, setSortMode] = useState<SortMode>('date')
 
   // Filter documents by folder view
   const visibleDocs = openFolderId
     ? documents.filter((d) => d.folderId === openFolderId)
     : documents.filter((d) => !d.folderId)
 
-  const filtered = filterDocuments(visibleDocs, activeFilter).filter((d) =>
-    search ? d.title.toLowerCase().includes(search.toLowerCase()) : true,
-  )
+  const filtered = filterDocuments(visibleDocs, activeFilter)
+    .filter((d) => (search ? d.title.toLowerCase().includes(search.toLowerCase()) : true))
+    .sort((a, b) => {
+      if (sortMode === 'name') return a.title.localeCompare(b.title)
+      if (sortMode === 'size') return b.size - a.size
+      return b.createdAt.localeCompare(a.createdAt) // date — newest first
+    })
 
   const currentFolder = folders.find((f) => f.id === openFolderId)
 
-  function handleDownload(doc: StoredDocument) {
-    if (doc.blobUrl) {
-      const a = document.createElement('a')
-      a.href = doc.blobUrl
-      a.download = doc.title
-      a.click()
+  async function handleDownload(doc: StoredDocument) {
+    let url = doc.blobUrl
+    let revoke = false
+    if (!url) {
+      const blob = await getBlob(doc.id) // blobUrl may not be re-hydrated yet
+      if (!blob) return
+      url = URL.createObjectURL(blob)
+      revoke = true
     }
+    const a = document.createElement('a')
+    a.href = url
+    a.download = doc.title
+    a.click()
+    if (revoke) setTimeout(() => URL.revokeObjectURL(url!), 1000)
   }
 
-  function handleShare(doc: StoredDocument) {
-    if (navigator.share && doc.blobUrl) {
-      fetch(doc.blobUrl)
-        .then((r) => r.blob())
-        .then((blob) => {
-          const file = new File([blob], doc.title, { type: 'application/pdf' })
-          navigator.share({ files: [file], title: doc.title }).catch(() => {})
-        })
+  async function handleShare(doc: StoredDocument) {
+    if (!('share' in navigator)) return
+    let blob: Blob | undefined
+    if (doc.blobUrl) {
+      try { blob = await fetch(doc.blobUrl).then((r) => r.blob()) } catch { /* fall back to IndexedDB */ }
     }
+    if (!blob) blob = await getBlob(doc.id)
+    if (!blob) return
+    const file = new File([blob], doc.title, { type: blob.type || (doc.type === 'jpg' ? 'image/jpeg' : 'application/pdf') })
+    try { await navigator.share({ files: [file], title: doc.title }) } catch { /* cancelled / unsupported */ }
   }
 
   function handleDelete(id: string) {
@@ -136,8 +152,11 @@ export default function Documents() {
             </h1>
           </div>
           <div className="flex items-center gap-1">
-            <button className="flex h-10 w-10 items-center justify-center rounded-full hover:bg-gray-100 dark:hover:bg-slate-800">
+            <button onClick={() => setSortMode((m) => sortModes[(sortModes.indexOf(m) + 1) % sortModes.length])}
+              aria-label={'Trier : ' + sortMode}
+              className="relative flex h-10 w-10 items-center justify-center rounded-full hover:bg-gray-100 dark:hover:bg-slate-800">
               <span className="material-symbols-outlined text-slate-600 dark:text-slate-300">sort</span>
+              <span className="absolute -bottom-0.5 right-0 rounded bg-primary px-1 text-[7px] font-bold uppercase text-white">{sortMode === 'date' ? 'DT' : sortMode === 'name' ? 'AZ' : 'KB'}</span>
             </button>
             <Link to="/profile" className="flex h-8 w-8 items-center justify-center rounded-full border border-primary/30 bg-primary/20 transition-transform active:scale-90">
               <span className="material-symbols-outlined text-sm text-primary">person</span>

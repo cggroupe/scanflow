@@ -135,6 +135,7 @@
   },
   "tools": {
     "title": "PDF Tools",
+    "comingSoon": "Soon",
     "organize": "Organize",
     "optimize": "Optimize",
     "convertToPdf": "Convert to PDF",

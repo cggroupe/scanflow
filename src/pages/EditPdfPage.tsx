@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { Link, useNavigate } from 'react-router-dom'
 import FileUploader from '@/components/FileUploader/FileUploader'
 import ResultScreen from '@/components/ResultScreen/ResultScreen'
+import { useDocumentStore } from '@/stores/documentStore'
 import {
   renderPdfPage,
   getPdfPageCount,
@@ -27,6 +28,10 @@ export default function EditPdfPage() {
   const navigate = useNavigate()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const overlayRef = useRef<HTMLCanvasElement>(null)
+  const pendingFile = useDocumentStore((s) => s.pendingFile)
+  const setPendingFile = useDocumentStore((s) => s.setPendingFile)
+  const addDocument = useDocumentStore((s) => s.addDocument)
+  const pendingConsumed = useRef(false)
 
   const [files, setFiles] = useState<File[]>([])
   const [phase, setPhase] = useState<Phase>('upload')
@@ -64,6 +69,24 @@ export default function EditPdfPage() {
     setAnnotations([])
     setPhase('editing')
   }
+
+  // Consume a file passed from the scanner "Modifier PDF" button (pendingFile).
+  useEffect(() => {
+    if (!pendingFile || pendingConsumed.current) return
+    pendingConsumed.current = true
+    const f = pendingFile
+    setFiles([f])
+    setPendingFile(null)
+    void (async () => {
+      const count = await getPdfPageCount(f)
+      const sizes = await getPdfPageSizes(f)
+      setPageCount(count)
+      setPageSizes(sizes)
+      setCurrentPage(1)
+      setAnnotations([])
+      setPhase('editing')
+    })()
+  }, [pendingFile, setPendingFile])
 
   // Render current page
   useEffect(() => {
@@ -226,7 +249,9 @@ export default function EditPdfPage() {
     setError(null)
     try {
       const bytes = await applyAnnotations(files[0], annotations)
-      setResultBlob(toBlob(bytes))
+      const blob = toBlob(bytes)
+      setResultBlob(blob)
+      addDocument({ id: `doc_${Date.now()}`, title: 'edited.pdf', type: 'pdf', size: blob.size, createdAt: new Date().toISOString() }, blob)
       setPhase('done')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error')

@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link } from 'react-router-dom'
 import { useAppStore } from '@/stores/appStore'
@@ -5,7 +6,7 @@ import { useDocumentStore, formatFileSize, formatRelativeDate } from '@/stores/d
 
 const quickActions = [
   { i18nKey: 'dashboard.smartScan', icon: 'center_focus_weak', path: '/scanner?mode=camera', bgClass: 'bg-primary/10', iconClass: 'text-primary icon-filled' },
-  { i18nKey: 'dashboard.pdfToWord', icon: 'picture_as_pdf', path: '/tools/pdf-to-word', bgClass: 'bg-orange-50 dark:bg-orange-900/20', iconClass: 'text-orange-500' },
+  { i18nKey: 'tools.compress', icon: 'compress', path: '/tools/compress', bgClass: 'bg-orange-50 dark:bg-orange-900/20', iconClass: 'text-orange-500' },
   { i18nKey: 'dashboard.importImages', icon: 'image', path: '/tools/jpg-to-pdf', bgClass: 'bg-blue-50 dark:bg-blue-900/20', iconClass: 'text-blue-500' },
 ]
 
@@ -19,7 +20,10 @@ export default function Dashboard() {
   const { t } = useTranslation()
   const openDrawer = useAppStore((s) => s.openDrawer)
   const documents = useDocumentStore((s) => s.documents)
-  const recentDocs = documents.slice(0, 5)
+  const [query, setQuery] = useState('')
+  const recentDocs = query.trim()
+    ? documents.filter((d) => d.title.toLowerCase().includes(query.trim().toLowerCase()))
+    : documents.slice(0, 5)
 
   return (
     <div className="flex min-h-screen flex-col bg-background dark:bg-[#131f1e]">
@@ -45,12 +49,17 @@ export default function Dashboard() {
           <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">search</span>
           <input
             type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
             placeholder={t('dashboard.searchPlaceholder')}
-            className="h-10 w-full rounded-lg border-none bg-slate-100 pl-10 pr-12 text-sm text-slate-900 placeholder:text-slate-400 focus:ring-2 focus:ring-primary/50 dark:bg-slate-800 dark:text-slate-100"
+            className="h-10 w-full rounded-lg border-none bg-slate-100 pl-10 pr-10 text-sm text-slate-900 placeholder:text-slate-400 focus:ring-2 focus:ring-primary/50 dark:bg-slate-800 dark:text-slate-100"
           />
-          <button className="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-1 hover:bg-slate-200 dark:hover:bg-slate-700">
-            <span className="material-symbols-outlined text-slate-400">filter_list</span>
-          </button>
+          {query && (
+            <button onClick={() => setQuery('')} aria-label={t('common.close')}
+              className="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-1 hover:bg-slate-200 dark:hover:bg-slate-700">
+              <span className="material-symbols-outlined text-slate-400">close</span>
+            </button>
+          )}
         </div>
       </header>
 
@@ -92,16 +101,7 @@ export default function Dashboard() {
             {recentDocs.map((doc) => (
               <Link
                 key={doc.id}
-                to={doc.blobUrl ? doc.blobUrl : '#'}
-                onClick={(e) => {
-                  e.preventDefault()
-                  if (doc.blobUrl) {
-                    const a = document.createElement('a')
-                    a.href = doc.blobUrl
-                    a.download = doc.title
-                    a.click()
-                  }
-                }}
+                to={`/documents/${doc.id}`}
                 className="flex items-center gap-4 rounded-xl border border-slate-50 bg-white p-3 shadow-sm transition-colors hover:bg-slate-50 active:bg-slate-100 dark:border-slate-800 dark:bg-[#1a2b2a] dark:hover:bg-[#1e3332]"
               >
                 {/* Thumbnail */}
@@ -124,8 +124,7 @@ export default function Dashboard() {
                   </div>
                 </div>
 
-                {/* Download icon */}
-                <span className="material-symbols-outlined text-slate-400">download</span>
+                <span className="material-symbols-outlined text-slate-400">chevron_right</span>
               </Link>
             ))}
           </div>

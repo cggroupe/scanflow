@@ -2,6 +2,7 @@ import { useTranslation } from 'react-i18next'
 import { Link } from 'react-router-dom'
 import { toolCategories } from '@/data/mockData'
 import { useAppStore } from '@/stores/appStore'
+import { supportedTools, dedicatedTools } from '@/hooks/useToolProcessor'
 import * as Icons from 'lucide-react'
 
 function getIcon(name: string) {
@@ -35,20 +36,28 @@ export default function Tools() {
             <div className="grid grid-cols-3 gap-3">
               {category.tools.map((tool) => {
                 const Icon = getIcon(tool.icon)
-                return (
-                  <Link
-                    key={tool.id}
-                    to={tool.path}
-                    className="group flex flex-col items-center gap-2"
-                  >
+                const key = tool.path.split('/').pop() ?? ''
+                const available = supportedTools.has(key) || dedicatedTools.has(key)
+                const inner = (
+                  <>
                     <div
-                      className="flex h-14 w-14 items-center justify-center rounded-xl transition-transform group-active:scale-95"
+                      className="relative flex h-14 w-14 items-center justify-center rounded-xl transition-transform group-active:scale-95"
                       style={{ backgroundColor: `${tool.color}15` }}
                     >
                       <Icon className="h-6 w-6" style={{ color: tool.color }} />
+                      {!available && (
+                        <span className="absolute -right-2 -top-1 rounded-full bg-slate-400 px-1.5 py-px text-[8px] font-bold uppercase text-white shadow">
+                          {t('tools.comingSoon')}
+                        </span>
+                      )}
                     </div>
                     <span className="text-center text-xs font-semibold text-slate-900 dark:text-slate-100">{t(tool.i18nKey)}</span>
-                  </Link>
+                  </>
+                )
+                return available ? (
+                  <Link key={tool.id} to={tool.path} className="group flex flex-col items-center gap-2">{inner}</Link>
+                ) : (
+                  <div key={tool.id} className="flex cursor-not-allowed flex-col items-center gap-2 opacity-40" aria-disabled="true">{inner}</div>
                 )
               })}
             </div>

@@ -44,6 +44,7 @@ export default function SignPage() {
 
   const pendingFile = useDocumentStore((s) => s.pendingFile)
   const setPendingFile = useDocumentStore((s) => s.setPendingFile)
+  const addDocument = useDocumentStore((s) => s.addDocument)
 
   const [files, setFiles] = useState<File[]>([])
   const [phase, setPhase] = useState<Phase>('upload')
@@ -238,7 +239,9 @@ export default function SignPage() {
       }
 
       const bytes = await addSignaturesWithMetadata(file, placements)
-      setResultBlob(toBlob(bytes))
+      const blob = toBlob(bytes)
+      setResultBlob(blob)
+      addDocument({ id: `doc_${Date.now()}`, title: 'signed.pdf', type: 'pdf', size: blob.size, createdAt: new Date().toISOString() }, blob)
       setPhase('done')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error')
