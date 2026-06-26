@@ -1,11 +1,9 @@
-// ScanFlow service worker — minimal offline support.
-// Bump CACHE on each deploy to invalidate stale assets.
-const CACHE = 'scanflow-v1'
-const SHELL = ['/', '/index.html', '/manifest.webmanifest']
+// ScanFlow service worker — network-first so a fresh deploy is always picked up
+// (cache is only an offline fallback). Bump CACHE to force-clear old caches.
+const CACHE = 'scanflow-v3'
 
-self.addEventListener('install', (event) => {
+self.addEventListener('install', () => {
   self.skipWaiting()
-  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL).catch(() => {})))
 })
 
 self.addEventListener('activate', (event) => {
@@ -22,26 +20,20 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return
 
   const url = new URL(req.url)
-  // Never touch cross-origin requests (OpenCV CDN, Supabase API/realtime, fonts).
+  // Never touch cross-origin requests (OpenCV CDN, Supabase API/realtime, fonts, pdf.js).
   if (url.origin !== self.location.origin) return
 
-  // Navigations: network-first, fall back to the cached shell when offline.
-  if (req.mode === 'navigate') {
-    event.respondWith(fetch(req).catch(() => caches.match('/index.html')))
-    return
-  }
-
-  // Same-origin static assets: cache-first, then network (and cache the result).
+  // Network-first for everything same-origin: always fresh when online; cache is a
+  // pure offline fallback. (Previously cache-first served stale builds after a deploy.)
   event.respondWith(
-    caches.match(req).then((cached) => {
-      if (cached) return cached
-      return fetch(req).then((res) => {
+    fetch(req)
+      .then((res) => {
         if (res && res.ok && res.type === 'basic') {
           const copy = res.clone()
           caches.open(CACHE).then((c) => c.put(req, copy))
         }
         return res
       })
-    }),
+      .catch(() => caches.match(req).then((cached) => cached || caches.match('/index.html'))),
   )
 })

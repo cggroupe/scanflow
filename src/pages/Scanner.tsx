@@ -80,26 +80,12 @@ function SliderRow({ icon, label, value, min, max, onChange }: {
 // ================================================================
 
 // Auto-capture tuning — adjust on a real device.
-const AUTO_STABLE_THRESHOLD = 0.025 // max normalized corner movement to count as "stable"
-const AUTO_FRAMES_SHARP = 2         // stable detections before auto-capture when sharp + framed
-const AUTO_FRAMES_BLUR = 5          // ...more when blurry (soft gate — never fully blocks)
+const AUTO_FRAMES_SHARP = 3         // present+framed frames before auto-capture when sharp
+const AUTO_FRAMES_BLUR = 6          // ...more when blurry (soft gate — never fully blocks)
 const SHARPNESS_MIN = 40            // min Laplacian variance to treat the frame as sharp
 const FRAMING_EDGE = 0.015          // corners must sit inside this margin (else doc is clipped)
 const FRAMING_AREA_MIN = 0.12       // quad must cover at least this fraction of the frame
 const FRAMING_AREA_MAX = 0.98
-
-function quadMaxDelta(a: QuadCorners, b: QuadCorners): number {
-  const pairs: Array<[{ x: number; y: number }, { x: number; y: number }]> = [
-    [a.topLeft, b.topLeft], [a.topRight, b.topRight],
-    [a.bottomRight, b.bottomRight], [a.bottomLeft, b.bottomLeft],
-  ]
-  let max = 0
-  for (const [p, q] of pairs) {
-    const d = Math.hypot(p.x - q.x, p.y - q.y)
-    if (d > max) max = d
-  }
-  return max
-}
 
 function quadArea(q: QuadCorners): number {
   const pts = [q.topLeft, q.topRight, q.bottomRight, q.bottomLeft]
@@ -169,7 +155,6 @@ export default function Scanner() {
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const videoContainerRef = useRef<HTMLDivElement>(null)
-  const overlayCanvasRef = useRef<HTMLCanvasElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const importRef = useRef<HTMLInputElement | null>(null)
   const autoOpenDone = useRef(false)
@@ -191,7 +176,6 @@ export default function Scanner() {
   const [scanMode, setScanMode] = useState<'batch' | 'single'>('batch')
   const [previewPageId, setPreviewPageId] = useState<string | null>(null)
   const stableFramesRef = useRef(0)
-  const lastStableQuadRef = useRef<QuadCorners | null>(null)
   const autoArmedRef = useRef(true)
   const capturePhotoRef = useRef<() => void>(() => {})
 
@@ -207,7 +191,7 @@ export default function Scanner() {
   const [editAdj, setEditAdj] = useState<Adjustments>(DEFAULT_ADJ)
   const [editPreviewUrl, setEditPreviewUrl] = useState('')
 
-  const { cvReady, liveQuad, sharpnessRef, cropCanvasWithCorners, startLiveDetection, stopLiveDetection } = useDocumentDetection({
+  const { cvReady, liveQuad, sharpnessRef, detectCorners, cropCanvasWithCorners, startLiveDetection, stopLiveDetection } = useDocumentDetection({
     enabled: phase === 'camera' || phase === 'crop',
   })
 
@@ -246,7 +230,6 @@ export default function Scanner() {
     }
     if (!liveQuad) {
       stableFramesRef.current = 0
-      lastStableQuadRef.current = null
       autoArmedRef.current = true
       setAutoCountdown(null)
       setAutoFeedback(null)
@@ -254,21 +237,19 @@ export default function Scanner() {
     }
     if (!autoArmedRef.current) return
 
-    // Quality gate 1 (hard): never auto-capture a clipped / badly framed document.
+    // Hard gate: never auto-capture a clipped / badly framed document.
     if (!isWellFramed(liveQuad)) {
       stableFramesRef.current = 0
-      lastStableQuadRef.current = liveQuad
       setAutoCountdown(null)
       setAutoFeedback('adjust')
       return
     }
 
-    const prev = lastStableQuadRef.current
-    const moved = prev ? quadMaxDelta(prev, liveQuad) : 1
-    lastStableQuadRef.current = liveQuad
-    stableFramesRef.current = moved < AUTO_STABLE_THRESHOLD ? stableFramesRef.current + 1 : 1
-
-    // Quality gate 2 (soft): blurry frames just need to hold still a bit longer.
+    // Count consecutive frames where a document is present and well framed. We do
+    // NOT require corner stability — that's what made the old preview jitter; the
+    // precise crop is done on the captured still. Sharp frames (phone steady) fire
+    // faster; blurry ones just wait a bit longer.
+    stableFramesRef.current += 1
     const sharp = sharpnessRef.current >= SHARPNESS_MIN
     const needed = sharp ? AUTO_FRAMES_SHARP : AUTO_FRAMES_BLUR
     setAutoFeedback(sharp ? null : 'blur')
@@ -284,75 +265,10 @@ export default function Scanner() {
     }
   }, [liveQuad, autoCapture, isCapturing, phase, sharpnessRef])
 
-  // Draw overlay on live video showing detected quad
-  useEffect(() => {
-    if (phase !== 'camera') return
-
-    const overlayCanvas = overlayCanvasRef.current
-    const container = videoContainerRef.current
-    if (!overlayCanvas || !container) return
-
-    const cW = container.clientWidth
-    const cH = container.clientHeight
-    overlayCanvas.width = cW
-    overlayCanvas.height = cH
-
-    const ctx = overlayCanvas.getContext('2d')!
-    ctx.clearRect(0, 0, cW, cH)
-
-    const video = videoRef.current
-    if (!liveQuad || !video) return
-
-    const vw = video.videoWidth
-    const vh = video.videoHeight
-    if (vw === 0 || vh === 0) return
-
-    // The <video> renders with object-cover: scaled by max(cW/vw, cH/vh) and
-    // center-cropped. The quad is normalized to the video frame, so map it through
-    // the SAME transform — otherwise the green frame drifts off the real edges.
-    const scale = Math.max(cW / vw, cH / vh)
-    const dispW = vw * scale
-    const dispH = vh * scale
-    const offsetX = (cW - dispW) / 2
-    const offsetY = (cH - dispH) / 2
-    const mapX = (nx: number) => offsetX + nx * dispW
-    const mapY = (ny: number) => offsetY + ny * dispH
-
-    const pts = [
-      { x: mapX(liveQuad.topLeft.x), y: mapY(liveQuad.topLeft.y) },
-      { x: mapX(liveQuad.topRight.x), y: mapY(liveQuad.topRight.y) },
-      { x: mapX(liveQuad.bottomRight.x), y: mapY(liveQuad.bottomRight.y) },
-      { x: mapX(liveQuad.bottomLeft.x), y: mapY(liveQuad.bottomLeft.y) },
-    ]
-
-    // Semi-transparent fill
-    ctx.fillStyle = 'rgba(45, 185, 173, 0.15)'
-    ctx.beginPath()
-    ctx.moveTo(pts[0].x, pts[0].y)
-    pts.forEach(p => ctx.lineTo(p.x, p.y))
-    ctx.closePath()
-    ctx.fill()
-
-    // Border
-    ctx.strokeStyle = '#2db9ad'
-    ctx.lineWidth = 3
-    ctx.beginPath()
-    ctx.moveTo(pts[0].x, pts[0].y)
-    pts.forEach(p => ctx.lineTo(p.x, p.y))
-    ctx.closePath()
-    ctx.stroke()
-
-    // Corner circles
-    ctx.fillStyle = '#2db9ad'
-    pts.forEach(p => {
-      ctx.beginPath()
-      ctx.arc(p.x, p.y, 8, 0, Math.PI * 2)
-      ctx.fill()
-      ctx.strokeStyle = '#fff'
-      ctx.lineWidth = 2
-      ctx.stroke()
-    })
-  }, [phase, liveQuad])
+  // NOTE: the live document quad is intentionally NOT drawn anymore. Re-detecting
+  // every frame made the frame jitter/dance. Instead we show a fixed guide zone and
+  // do the precise crop on the captured still (stable). Live detection only drives
+  // the auto-capture "hold steady" logic.
 
   // Editing page reference
   const editingPage = pages.find((p) => p.id === editingPageId) ?? null
@@ -389,7 +305,15 @@ export default function Scanner() {
     }
 
     try {
-      const stream = await requestCameraStream()
+      // The camera can still be releasing from a previous session (e.g. returning
+      // from review via "Ajouter") — retry once after a short delay before failing.
+      let stream: MediaStream
+      try {
+        stream = await requestCameraStream()
+      } catch {
+        await new Promise((r) => setTimeout(r, 400))
+        stream = await requestCameraStream()
+      }
       streamRef.current = stream
       setPhase('camera')
 
@@ -429,10 +353,10 @@ export default function Scanner() {
         streamRef.current.getTracks().forEach((tr) => tr.stop())
         streamRef.current = null
       }
-      setPhase('home')
+      setPhase(pages.length > 0 ? 'review' : 'home')
       setCameraError(t('scanner.cameraError'))
     }
-  }, [t])
+  }, [t, pages])
 
   useEffect(() => {
     if (!autoOpenDone.current && searchParams.get('mode') === 'camera' && phase === 'home') {
@@ -491,49 +415,36 @@ export default function Scanner() {
       fullCanvas.height = vh
       fullCanvas.getContext('2d')!.drawImage(video, 0, 0)
 
-      if (liveQuad) {
-        // Auto-crop using the tracked live quad directly (Engine v2 already smooths
-        // and tracks it). Skipping a full-res re-detect here keeps the shutter snappy.
-        stopLiveDetection()
-        const quad = liveQuad
+      stopLiveDetection()
+
+      // Detect the document on the STABLE full-resolution still (not the jittery live
+      // preview) and crop to it. If nothing is found, keep the full frame — never a
+      // manual-crop screen (the user wants it fully automatic).
+      const detected = await detectCorners(fullCanvas)
+      let rawCanvas = fullCanvas
+      if (detected) {
         const pixelCorners: QuadCorners = {
-          topLeft: { x: quad.topLeft.x * vw, y: quad.topLeft.y * vh },
-          topRight: { x: quad.topRight.x * vw, y: quad.topRight.y * vh },
-          bottomRight: { x: quad.bottomRight.x * vw, y: quad.bottomRight.y * vh },
-          bottomLeft: { x: quad.bottomLeft.x * vw, y: quad.bottomLeft.y * vh },
+          topLeft: { x: detected.topLeft.x * vw, y: detected.topLeft.y * vh },
+          topRight: { x: detected.topRight.x * vw, y: detected.topRight.y * vh },
+          bottomRight: { x: detected.bottomRight.x * vw, y: detected.bottomRight.y * vh },
+          bottomLeft: { x: detected.bottomLeft.x * vw, y: detected.bottomLeft.y * vh },
         }
-
         const result = await cropCanvasWithCorners(fullCanvas, pixelCorners)
-        const rawCanvas = result.canvas ?? fullCanvas
+        if (result.canvas) rawCanvas = result.canvas
+      }
 
-        // Async encode (toBlob) — avoids the blocking toDataURL+atob path.
-        const { file, url: thumbnailUrl } = await processAndCreateFile(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
-        const id = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+      const { file, url: thumbnailUrl } = await processAndCreateFile(rawCanvas, DEFAULT_FILTER, DEFAULT_ADJ)
+      const id = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+      setPages((prev) => [...prev, { id, rawCanvas, filter: DEFAULT_FILTER, adjustments: { ...DEFAULT_ADJ }, processedFile: file, thumbnailUrl }])
 
-        setPages((prev) => [...prev, { id, rawCanvas, filter: DEFAULT_FILTER, adjustments: { ...DEFAULT_ADJ }, processedFile: file, thumbnailUrl }])
+      setCameraSuccess(t('scanner.documentDetected'))
+      setTimeout(() => setCameraSuccess(null), 2000)
 
-        setCameraSuccess(t('scanner.documentDetected'))
-        setTimeout(() => setCameraSuccess(null), 2000)
-
-        if (scanMode === 'single') {
-          // Single mode: one page, then straight to review.
-          stopCamera()
-          setPhase('review')
-        } else {
-          // Batch mode: keep scanning the next page.
-          startLiveDetection(videoRef)
-        }
-      } else {
-        // No quad detected — go to manual crop
+      if (scanMode === 'single') {
         stopCamera()
-        setCropCanvas(fullCanvas)
-        setCropCorners({
-          topLeft: { x: 0.1, y: 0.1 },
-          topRight: { x: 0.9, y: 0.1 },
-          bottomRight: { x: 0.9, y: 0.9 },
-          bottomLeft: { x: 0.1, y: 0.9 },
-        })
-        setPhase('crop')
+        setPhase('review')
+      } else {
+        startLiveDetection(videoRef)
       }
     } catch (err) {
       setCameraError(err instanceof Error ? err.message : t('scanner.cameraError'))
@@ -866,19 +777,18 @@ export default function Scanner() {
       <div className="fixed inset-0 z-50 flex flex-col bg-black">
         <div ref={videoContainerRef} className="relative flex-1 overflow-hidden">
           <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover" />
-          <canvas ref={overlayCanvasRef} className="pointer-events-none absolute inset-0 h-full w-full" />
 
-          {!liveQuad && (
-            <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-              <div className="relative" style={{ width: '80%', aspectRatio: '210 / 297', boxShadow: '0 0 0 9999px rgba(0,0,0,0.4)', borderRadius: '8px' }}>
-                <div className="absolute inset-0 rounded-lg border border-white/50" />
-                <div className="absolute -left-px -top-px h-7 w-7 rounded-tl-lg border-l-[3px] border-t-[3px] border-primary" />
-                <div className="absolute -right-px -top-px h-7 w-7 rounded-tr-lg border-r-[3px] border-t-[3px] border-primary" />
-                <div className="absolute -bottom-px -left-px h-7 w-7 rounded-bl-lg border-b-[3px] border-l-[3px] border-primary" />
-                <div className="absolute -bottom-px -right-px h-7 w-7 rounded-br-lg border-b-[3px] border-r-[3px] border-primary" />
-              </div>
+          {/* Fixed guide zone — place the document inside. Corners turn green when a
+              document is detected; the precise crop happens on the captured still. */}
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+            <div className="relative" style={{ width: '82%', aspectRatio: '210 / 297', boxShadow: '0 0 0 9999px rgba(0,0,0,0.35)', borderRadius: '8px' }}>
+              <div className={`absolute inset-0 rounded-lg border transition-colors ${liveQuad ? 'border-green-400/70' : 'border-white/40'}`} />
+              <div className={`absolute -left-px -top-px h-7 w-7 rounded-tl-lg border-l-[3px] border-t-[3px] transition-colors ${liveQuad ? 'border-green-400' : 'border-primary'}`} />
+              <div className={`absolute -right-px -top-px h-7 w-7 rounded-tr-lg border-r-[3px] border-t-[3px] transition-colors ${liveQuad ? 'border-green-400' : 'border-primary'}`} />
+              <div className={`absolute -bottom-px -left-px h-7 w-7 rounded-bl-lg border-b-[3px] border-l-[3px] transition-colors ${liveQuad ? 'border-green-400' : 'border-primary'}`} />
+              <div className={`absolute -bottom-px -right-px h-7 w-7 rounded-br-lg border-b-[3px] border-r-[3px] transition-colors ${liveQuad ? 'border-green-400' : 'border-primary'}`} />
             </div>
-          )}
+          </div>
 
           <div className={`pointer-events-none absolute inset-0 z-10 bg-white transition-opacity duration-200 ease-out ${showFlash ? 'opacity-70' : 'opacity-0'}`} />
 
